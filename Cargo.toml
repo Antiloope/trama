@@ -1,0 +1,41 @@
+# The Trama workspace: one repository, several packages ("crates") that are
+# built, tested and versioned together. See docs/architecture.md, section 6.
+
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+# Settings shared by every crate (each crate opts in with `x.workspace = true`).
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+publish = false
+
+# Internal crates, so each one can say `trama-protocol.workspace = true`.
+[workspace.dependencies]
+trama-protocol = { path = "crates/trama-protocol" }
+trama-dsp = { path = "crates/trama-dsp" }
+trama-engine = { path = "crates/trama-engine" }
+trama-core = { path = "crates/trama-core" }
+trama-io = { path = "crates/trama-io" }
+
+[workspace.lints.rust]
+# No crate may use `unsafe`. A future plugin-hosting crate will be the single,
+# documented exception (talking to C/C++ plugins requires it).
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+
+# Audio code compiled without optimizations can be 10-50x slower and glitch,
+# so even debug builds are partly optimized.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"

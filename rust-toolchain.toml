@@ -1,0 +1,4 @@
+# Both computers (and CI) use the latest stable Rust with the same tools.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

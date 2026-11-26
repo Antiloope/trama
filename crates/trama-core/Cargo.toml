@@ -1,0 +1,15 @@
+[package]
+name = "trama-core"
+description = "Trama's brain: session state, setups, mappings, scenes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Allowed, added when first used: trama-protocol.
+# See docs/architecture.md, section 6.
+
+[lints]
+workspace = true

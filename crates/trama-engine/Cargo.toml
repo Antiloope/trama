@@ -1,0 +1,15 @@
+[package]
+name = "trama-engine"
+description = "Trama's real-time audio engine: audio graph, clock, loopers, mixer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Allowed, added when first used: trama-protocol, trama-dsp.
+# See docs/architecture.md, section 6.
+
+[lints]
+workspace = true
