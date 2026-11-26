@@ -14,9 +14,9 @@ license = "GPL-3.0-or-later"
 publish = false
 
 # Internal crates, so each one can say `trama-protocol.workspace = true`.
+# (trama-dsp joins this list when the engine first uses it.)
 [workspace.dependencies]
 trama-protocol = { path = "crates/trama-protocol" }
-trama-dsp = { path = "crates/trama-dsp" }
 trama-engine = { path = "crates/trama-engine" }
 trama-core = { path = "crates/trama-core" }
 trama-io = { path = "crates/trama-io" }

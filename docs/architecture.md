@@ -83,6 +83,16 @@ There are five kinds of messages. Their types live in `trama-protocol`.
 clip"). The **mappings** in the setup file are the bridge between the two,
 which is why changing a setup never needs new code.
 
+Mappings work in both directions. Going in, they turn `Input`s into
+`Command`s. Going out, they decide how each control should be lit to show
+the session, so some `Notification`s are addressed to one device: "light
+pad (4, 5) on `pads` green", or "send this pitch bend to `synth` now". That
+keeps adapters as plain translators: the Launchpad adapter knows how to
+light a pad, not what a lit pad means.
+
+A sixth message, `MidiOut`, goes from the engine straight to the MIDI
+output: notes and clock that must land on an exact sample (section 4).
+
 `Command`s can also arrive directly, without an `Input`: the web page and
 other computers send them.
 
@@ -107,6 +117,11 @@ other computers send them.
 
 From press to blinking light takes a millisecond or two. The sound itself
 waits for the bar line on purpose.
+
+The looper arrives in milestone 3, but milestone 1's step sequencer already
+takes this path: a pad press becomes `ToggleStep`, the core updates the
+pattern, the engine gets `SetStep`, and the Launchpad gets the pad's new
+light.
 
 ### Why messages
 
@@ -148,6 +163,26 @@ master clock. Bars and beats are computed from the count and the tempo.
 - **Ableton Link** *(planned)*: the engine nudges its tempo and beat phase to
   match other computers and apps on the network.
 
+### From samples to MIDI
+
+A MIDI port only knows "send now", so the MIDI output has to turn "sample
+96 000" into a moment on the computer's clock:
+
+1. every block, the engine leaves an **anchor** in the MIDI queue: "the
+   block starting at sample S was computed at instant T";
+2. the MIDI output keeps the last 64 anchors and, for each, the offset
+   between T and S. Audio callbacks can wake up late but never early, and a
+   stream starts with a burst of blocks to fill the sound card's buffer, so
+   it uses the **smallest** recent offset: the callback that was most on
+   time;
+3. each message is sent at its sample's time plus a fixed 10 ms, so it is
+   never late because the MIDI thread itself woke up a little late.
+
+Live controls (pitch bend, the modulation wheel) skip all of this: they are
+sent the moment they arrive. Measured against a virtual synth on Linux with
+PipeWire, the clock pulses come out within a fraction of a millisecond of
+where they belong.
+
 Two kinds of loops, both supported by the engine from the start:
 
 - **synced loops** have a length in bars and follow the tempo (beats, rave);
@@ -164,7 +199,7 @@ Trama runs several threads (things happening at the same time):
   └──────────▲──────────────────┬────────────┘
              │  lock-free queues: fixed size, never block
   ┌──────────┴──────────────────▼────────────┐
-  │ core thread                              │  session, mappings
+  │ core thread (the program's main thread)  │  session, mappings
   └──────────▲──────────────────┬────────────┘
              │  channels
   ┌──────────┴──────────────────▼────────────┐
@@ -247,7 +282,19 @@ It also makes rebuilds faster, since only the crates that changed recompile.
 
 An internal dependency is added to a crate's `Cargo.toml` the first time code
 uses it (Cargo warns about unused dependencies), always following the
-diagram above.
+diagram above. `trama-dsp` has no users yet; it joins when the engine makes
+its first sound (milestone 2).
+
+The main outside libraries, and the crate that uses each:
+
+| Library             | Used by        | For                                          |
+|---------------------|----------------|----------------------------------------------|
+| `rtrb`              | engine         | lock-free queues to and from the audio thread |
+| `cpal`              | io             | the sound card (PipeWire, ALSA, CoreAudio)   |
+| `midir`             | io             | MIDI ports (ALSA, CoreMIDI)                  |
+| `gilrs`             | io             | gamepads (evdev, IOKit)                      |
+| `crossbeam-channel` | io, program    | channels between normal threads              |
+| `clap`              | program        | the command line                             |
 
 Planned crates:
 
@@ -338,9 +385,11 @@ manager. Everything goes through it:
   macOS on every push, so "works on both" is checked by a machine. It runs
   once the repository is on GitHub.
 
-System libraries, needed once audio, MIDI and gamepad code lands:
+System libraries for audio, MIDI and gamepads:
 
 - Fedora: `sudo dnf install alsa-lib-devel pipewire-devel clang-devel systemd-devel`
+  (ALSA for MIDI, PipeWire for audio, clang to generate PipeWire's Rust
+  bindings, systemd's libudev for gamepads)
 - macOS: `xcode-select --install`
 
 macOS asks for **microphone permission** before any program can record from
@@ -363,15 +412,20 @@ From fastest to slowest:
    the sound.
 4. **Real-time safety tests.** Run the engine processor under
    `assert_no_alloc`; the test fails if the audio path allocates.
-5. **Adapter tests.** Byte sequences recorded from the real devices
-   (fixtures) go into an adapter, and we check the `Input`s that come out.
-   Virtual MIDI ports, available on Linux and macOS, let us test the whole
-   chain without hardware.
-6. **Hardware smoke tests.** A short manual checklist per device, helped by
-   a planned `trama doctor` command that lists the audio devices, MIDI ports,
-   gamepads and network address it finds.
+5. **Adapter tests.** Byte sequences from the real devices' manuals go into
+   an adapter, and we check the `Input`s that come out (and the bytes that
+   light each control).
+6. **End to end, without hardware.** `cargo run -p trama-io --example
+   fake_gear` creates a pretend Launchpad and synth on virtual MIDI ports
+   (Linux and macOS). Point `trama play` at them and it presses pads,
+   plays, stops, and reports the notes the synth got and how steady the
+   MIDI clock was. It needs a running MIDI system, so CI does not run it.
+7. **Hardware smoke tests.** A short manual checklist per device, helped by
+   `trama doctor`, which lists the audio outputs, MIDI ports and gamepads it
+   finds.
 
-CI runs 1 to 5 on Linux and macOS. Number 6 is you, with the gear.
+CI runs 1 to 5 on Linux and macOS. Numbers 6 and 7 are you, at the
+computer and with the gear.
 
 ## 11. License
 
@@ -396,6 +450,8 @@ Each milestone is playable on its own.
    only job is keeping time. The Launchpad becomes a step sequencer, the
    gamepad adds pitch bend, and both drive the MiniBrute 2S over MIDI with
    MIDI clock. This exercises IO, core, protocol and the clock.
+   *(in progress: works end to end with virtual devices; waiting for a try
+   with the real gear)*
 2. **First sounds**: a simple synth in `trama-dsp`, the engine playing it,
    offline tests that render to WAV.
 3. **Looper**: record the Scarlett inputs into synced and free loops, with the

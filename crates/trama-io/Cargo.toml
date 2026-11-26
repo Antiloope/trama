@@ -8,8 +8,12 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-# Allowed, added when first used: trama-protocol.
-# See docs/architecture.md, section 6.
+cpal = { version = "0.18.2", features = ["pipewire"] }
+crossbeam-channel = "0.5.17"
+gilrs = "0.11.2"
+midir = "0.11.2"
+rtrb = "0.4.1"
+trama-protocol.workspace = true
 
 [lints]
 workspace = true

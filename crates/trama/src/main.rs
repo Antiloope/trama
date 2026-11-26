@@ -3,14 +3,39 @@
 //! The `trama` program.
 //!
 //! This is the only crate that knows every other one. Its job is to read the
-//! command line and the setup file, start the threads (audio, core, I/O) and
-//! connect them with queues and channels.
+//! command line, start the adapters, the engine and the core, and connect
+//! them with queues and channels.
 //!
 //! See `docs/architecture.md`, sections 5 and 6.
 
-fn main() {
-    println!(
-        "trama {}: nothing to play yet. See docs/architecture.md.",
-        env!("CARGO_PKG_VERSION")
-    );
+mod doctor;
+mod play;
+
+use clap::{Parser, Subcommand};
+
+#[derive(Parser)]
+#[command(
+    name = "trama",
+    version,
+    about = "Connect synths, controllers and gamepads, and play."
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// List the audio outputs, MIDI ports and gamepads Trama can see.
+    Doctor,
+    /// Play the step sequencer: a Launchpad X and a gamepad driving a MIDI
+    /// synth, in time with the sound card.
+    Play(play::PlayArgs),
+}
+
+fn main() -> anyhow::Result<()> {
+    match Cli::parse().command {
+        Command::Doctor => doctor::run(),
+        Command::Play(args) => play::run(args),
+    }
 }
