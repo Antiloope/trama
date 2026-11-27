@@ -148,11 +148,10 @@ impl LaunchpadX {
         F: FnMut(Input) + Send + 'static,
     {
         let (output, port_name) = super::connect_output(port)?;
-        let input_device = device.clone();
         let input = super::connect_input(port, move |bytes| {
             if let Some((control, action)) = parse(bytes) {
                 on_input(Input {
-                    device: input_device.clone(),
+                    device,
                     control,
                     action,
                 });

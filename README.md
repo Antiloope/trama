@@ -5,10 +5,14 @@ in time with the sound card, without a DAW. It is free software written in
 Rust, and runs on Linux and macOS.
 
 It runs an 8-step sequencer: a grid controller edits the pattern and shows
-the playhead, a gamepad adds pitch bend and modulation, and a synth with a
+the playhead, gamepads add pitch bend and modulation, and a synth with a
 MIDI input plays the notes and follows Trama's MIDI clock. What reaches the
 sound card's inputs, a synth's audio or a microphone, can play through
 Trama to its outputs.
+
+Inside, the sequencer is a module, connected to the devices the way a
+patchbay connects gear; [the architecture](docs/architecture.md) explains
+modules and connections.
 
 ## Supported devices
 
@@ -102,8 +106,9 @@ Controls:
 - **Grid**: each column is a step, each row a scale degree (root at the
   bottom). The button beside the top row: play/stop; beside the bottom row:
   clear. Up/down: octave. Left/right: tempo.
-- **Gamepad**: A plays/stops, the left stick bends pitch, the right trigger is
-  the modulation wheel, the D-pad does octave and tempo.
+- **Gamepads**: A plays/stops, the left stick bends pitch, the right trigger
+  is the modulation wheel, the D-pad does octave and tempo. Every gamepad
+  plugged in does the same.
 
 ### Without hardware
 

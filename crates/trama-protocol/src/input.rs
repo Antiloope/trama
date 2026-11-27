@@ -2,38 +2,11 @@
 
 //! `Input`: something happened on a device.
 
-use std::fmt;
-use std::sync::Arc;
-
-/// The name Trama gives one connected device, such as `pads`, `synth` or
-/// `joy`. Cheap to clone.
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub struct DeviceId(Arc<str>);
-
-impl DeviceId {
-    pub fn new(name: &str) -> DeviceId {
-        DeviceId(name.into())
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Debug for DeviceId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}", self.as_str())
-    }
-}
-
-impl fmt::Display for DeviceId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
+use crate::name::DeviceId;
 
 /// A control on a device, named by what kind of control it is rather than by
-/// the model it is on, so a mapping works with every device of the same kind.
+/// the model it is on, so a connection works with every device of the same
+/// kind.
 ///
 /// - Grid controllers report their pads as [`Control::Pad`], the buttons
 ///   beside the rows as [`Control::RowButton`], and their arrow buttons as
@@ -67,7 +40,7 @@ pub enum Action {
     },
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Input {
     pub device: DeviceId,
     pub control: Control,

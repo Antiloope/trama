@@ -5,13 +5,27 @@
 
 use std::time::Instant;
 
-use trama_engine::{Engine, EngineConfig, GraphError};
-use trama_protocol::{EngineCommand, GraphDescription, Jack, MidiOut, NodeId, NodeKind, StepNote};
+use trama_engine::{Engine, EngineConfig, EngineController, EngineError};
+use trama_protocol::{
+    Channel, ClockDescription, DeviceId, EngineCommand, EnginePatch, GraphDescription, Jack,
+    MidiOut, ModuleId, NodeId, NodeKind, StepNote, StepPlayerDescription,
+};
 
 const SAMPLE_RATE: u32 = 48_000;
 
 fn engine() -> Engine {
     Engine::new(EngineConfig::new(SAMPLE_RATE))
+}
+
+/// Most tests here only need the audio graph.
+trait SetGraph {
+    fn set_graph(&mut self, graph: &GraphDescription) -> Result<(), EngineError>;
+}
+
+impl SetGraph for EngineController {
+    fn set_graph(&mut self, graph: &GraphDescription) -> Result<(), EngineError> {
+        self.set_patch(&EnginePatch::from(graph.clone()))
+    }
 }
 
 /// Interleaved noise for `channels` channels, the same on every run.
@@ -238,24 +252,24 @@ fn what_is_not_a_number_never_reaches_the_card() {
 }
 
 #[test]
-fn bad_descriptions_are_refused() {
+fn bad_graphs_are_refused() {
     let mut engine = engine();
     let mut set = |graph: &GraphDescription| engine.controller.set_graph(graph);
 
     let mut duplicate = passthrough(1, 1.0);
     duplicate.nodes[1].id = NodeId(0);
-    assert_eq!(set(&duplicate), Err(GraphError::DuplicateNode(NodeId(0))));
+    assert_eq!(set(&duplicate), Err(EngineError::DuplicateNode(NodeId(0))));
 
     let mut unknown = passthrough(1, 1.0);
     unknown.connect(NodeId(0).jack(0), NodeId(99).jack(0));
-    assert_eq!(set(&unknown), Err(GraphError::UnknownNode(NodeId(99))));
+    assert_eq!(set(&unknown), Err(EngineError::UnknownNode(NodeId(99))));
 
     // An output node has no output jack.
     let mut from_output = passthrough(1, 1.0);
     from_output.connect(NodeId(2).jack(0), NodeId(1).jack(0));
     assert_eq!(
         set(&from_output),
-        Err(GraphError::NoSuchJack(Jack {
+        Err(EngineError::NoSuchJack(Jack {
             node: NodeId(2),
             index: 0
         }))
@@ -265,7 +279,7 @@ fn bad_descriptions_are_refused() {
     second_jack.connect(NodeId(0).jack(0), NodeId(1).jack(1));
     assert_eq!(
         set(&second_jack),
-        Err(GraphError::NoSuchJack(NodeId(1).jack(1)))
+        Err(EngineError::NoSuchJack(NodeId(1).jack(1)))
     );
 
     let mut looped = GraphDescription::new();
@@ -273,10 +287,10 @@ fn bad_descriptions_are_refused() {
     let b = looped.add(NodeId(2), gain(1.0));
     looped.connect(a.jack(0), b.jack(0));
     looped.connect(b.jack(0), a.jack(0));
-    assert_eq!(set(&looped), Err(GraphError::Loop));
+    assert_eq!(set(&looped), Err(EngineError::Loop));
 
     let not_a_number = passthrough(1, f32::NAN);
-    assert_eq!(set(&not_a_number), Err(GraphError::InvalidGain(NodeId(1))));
+    assert_eq!(set(&not_a_number), Err(EngineError::InvalidGain(NodeId(1))));
 }
 
 #[test]
@@ -285,13 +299,13 @@ fn a_refused_graph_leaves_the_running_one_alone() {
     engine.controller.set_graph(&passthrough(1, 1.0)).unwrap();
     let mut looped = passthrough(1, 1.0);
     looped.connect(NodeId(1).jack(0), NodeId(1).jack(0));
-    assert_eq!(engine.controller.set_graph(&looped), Err(GraphError::Loop));
+    assert_eq!(engine.controller.set_graph(&looped), Err(EngineError::Loop));
     let input = noise(500, 1);
     assert_eq!(run(&mut engine, &input, 1, 1, 128), input);
 }
 
 #[test]
-fn graphs_waiting_are_limited_and_freed_once_swapped() {
+fn patches_waiting_are_limited_and_freed_once_swapped() {
     let mut engine = engine();
     let mut sent = 0;
     while engine.controller.set_graph(&passthrough(1, 1.0)).is_ok() {
@@ -300,7 +314,7 @@ fn graphs_waiting_are_limited_and_freed_once_swapped() {
     }
     assert_eq!(
         engine.controller.set_graph(&passthrough(1, 1.0)),
-        Err(GraphError::QueueFull)
+        Err(EngineError::QueueFull)
     );
 
     // The processor runs the last one and hands every other one back.
@@ -311,15 +325,37 @@ fn graphs_waiting_are_limited_and_freed_once_swapped() {
 }
 
 #[test]
-fn the_sequencer_keeps_time_while_the_graph_plays() {
+fn step_players_keep_time_while_the_graph_plays() {
     let midi = |with_graph: bool| {
         let mut engine = engine();
+        let clock = ModuleId::new("clock").unwrap();
+        let player = ModuleId::new("sequencer").unwrap();
+        let synth = DeviceId::new("synth").unwrap();
+        let mut patch = EnginePatch {
+            clocks: vec![ClockDescription {
+                id: clock,
+                bpm: 120.0,
+                midi_to: vec![synth],
+            }],
+            step_players: vec![StepPlayerDescription {
+                id: player,
+                clock,
+                channel: Channel::ONE,
+                pulses_per_step: 6,
+                gate_pulses: 3,
+                pattern: vec![None; 8],
+                midi_to: vec![synth],
+            }],
+            ..EnginePatch::default()
+        };
         if with_graph {
-            engine.controller.set_graph(&passthrough(2, 1.0)).unwrap();
+            patch.graph = passthrough(2, 1.0);
         }
+        engine.controller.set_patch(&patch).unwrap();
         engine
             .controller
             .send(EngineCommand::SetStep {
+                player,
                 step: 0,
                 note: Some(StepNote {
                     pitch: 60,
@@ -327,11 +363,17 @@ fn the_sequencer_keeps_time_while_the_graph_plays() {
                 }),
             })
             .unwrap();
-        engine.controller.send(EngineCommand::Play).unwrap();
+        engine
+            .controller
+            .send(EngineCommand::Play { clock })
+            .unwrap();
         run(&mut engine, &noise(50_000, 2), 2, 2, 512);
         let mut messages = Vec::new();
         while let Ok(out) = engine.midi.pop() {
-            if let MidiOut::Message { at_sample, message } = out {
+            if let MidiOut::Message {
+                at_sample, message, ..
+            } = out
+            {
                 messages.push((at_sample, message));
             }
         }

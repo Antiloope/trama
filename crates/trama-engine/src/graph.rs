@@ -8,49 +8,14 @@
 //! prepared graph never allocates, locks or blocks.
 
 use std::collections::VecDeque;
-use std::fmt;
 use std::ops::Range;
 
-use trama_protocol::{GraphDescription, Jack, MAX_GAIN, NodeId, NodeKind};
+use trama_protocol::{GraphDescription, MAX_GAIN, NodeId, NodeKind};
+
+use crate::EngineError;
 
 /// The most frames a graph runs at once. Longer blocks run in pieces.
 pub(crate) const MAX_FRAMES: usize = 1024;
-
-/// Why a description cannot become a graph, or cannot be sent.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum GraphError {
-    DuplicateNode(NodeId),
-    /// A cable names a node the description does not have.
-    UnknownNode(NodeId),
-    /// A cable starts at an output jack, or ends at an input jack, that its
-    /// node does not have.
-    NoSuchJack(Jack),
-    Loop,
-    /// A gain that is not a number, or infinite.
-    InvalidGain(NodeId),
-    /// The engine has as many graphs waiting as it can hold.
-    QueueFull,
-}
-
-impl fmt::Display for GraphError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            GraphError::DuplicateNode(id) => write!(f, "two nodes have the id {id}"),
-            GraphError::UnknownNode(id) => {
-                write!(
-                    f,
-                    "a cable goes to or from node {id}, which is not in the graph"
-                )
-            }
-            GraphError::NoSuchJack(jack) => write!(f, "a cable uses {jack}, which does not exist"),
-            GraphError::Loop => f.write_str("the cables form a loop"),
-            GraphError::InvalidGain(id) => write!(f, "node {id} has a gain that is not a number"),
-            GraphError::QueueFull => f.write_str("the engine has too many graphs waiting"),
-        }
-    }
-}
-
-impl std::error::Error for GraphError {}
 
 /// A graph the audio thread can run.
 pub(crate) struct PreparedGraph {
@@ -310,7 +275,7 @@ fn read_channel(input: &[f32], channels: usize, offset: usize, channel: usize, o
 }
 
 /// Checks `description` and turns it into a graph the audio thread can run.
-pub(crate) fn prepare(description: &GraphDescription) -> Result<PreparedGraph, GraphError> {
+pub(crate) fn prepare(description: &GraphDescription) -> Result<PreparedGraph, EngineError> {
     let nodes = &description.nodes;
 
     let mut by_id: Vec<(NodeId, usize)> = nodes
@@ -320,18 +285,18 @@ pub(crate) fn prepare(description: &GraphDescription) -> Result<PreparedGraph, G
         .collect();
     by_id.sort_unstable();
     if let Some(pair) = by_id.windows(2).find(|pair| pair[0].0 == pair[1].0) {
-        return Err(GraphError::DuplicateNode(pair[0].0));
+        return Err(EngineError::DuplicateNode(pair[0].0));
     }
     let index_of = |id: NodeId| {
         by_id
             .binary_search_by_key(&id, |&(id, _)| id)
             .map(|found| by_id[found].1)
-            .map_err(|_| GraphError::UnknownNode(id))
+            .map_err(|_| EngineError::UnknownNode(id))
     };
 
     for node in nodes {
         if matches!(node.kind, NodeKind::Gain { gain, .. } if !gain.is_finite()) {
-            return Err(GraphError::InvalidGain(node.id));
+            return Err(EngineError::InvalidGain(node.id));
         }
     }
 
@@ -341,10 +306,10 @@ pub(crate) fn prepare(description: &GraphDescription) -> Result<PreparedGraph, G
         let from = index_of(cable.from.node)?;
         let to = index_of(cable.to.node)?;
         if cable.from.index >= nodes[from].kind.outputs() {
-            return Err(GraphError::NoSuchJack(cable.from));
+            return Err(EngineError::NoSuchJack(cable.from));
         }
         if cable.to.index >= nodes[to].kind.inputs() {
-            return Err(GraphError::NoSuchJack(cable.to));
+            return Err(EngineError::NoSuchJack(cable.to));
         }
         cables.push((
             from,
@@ -420,7 +385,7 @@ pub(crate) fn prepare(description: &GraphDescription) -> Result<PreparedGraph, G
 fn running_order(
     nodes: usize,
     cables: &[(usize, usize, usize, usize)],
-) -> Result<Vec<usize>, GraphError> {
+) -> Result<Vec<usize>, EngineError> {
     let mut waiting_for = vec![0_usize; nodes];
     for &(_, _, to, _) in cables {
         waiting_for[to] += 1;
@@ -439,7 +404,7 @@ fn running_order(
         }
     }
     if order.len() < nodes {
-        return Err(GraphError::Loop);
+        return Err(EngineError::Loop);
     }
     Ok(order)
 }

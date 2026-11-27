@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! `trama play`: the step sequencer, and monitoring of the sound card's
-//! inputs.
+//! inputs, as a patch built in code (see [`patch`]).
 //!
 //! Threads:
 //!
@@ -11,24 +11,24 @@
 //! - adapter threads: Launchpad input (midir) and lights, gamepads, synth
 //!   MIDI output.
 
-use std::collections::{BTreeMap, BTreeSet};
+mod patch;
+
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use clap::Args;
 use crossbeam_channel::{RecvTimeoutError, Sender};
+use patch::{Monitoring, PADS, SYNTH};
+use trama_core::modules::step_sequencer::StepSequencerSettings;
 use trama_core::music::{Scale, note_name, parse_note};
-use trama_core::{Core, CoreConfig, Output};
-use trama_engine::{Engine, EngineConfig, EngineController, PULSES_PER_QUARTER};
+use trama_core::{Core, Output};
+use trama_engine::{Engine, EngineConfig, EngineController};
 use trama_io::audio::{InputDevice, InputStats, OutputDevice};
-use trama_io::gamepad::Gamepads;
+use trama_io::gamepad::{GamepadEvent, Gamepads};
 use trama_io::midi::launchpad_x::{self, LaunchpadX};
-use trama_io::midi::synth::{SynthOutput, SynthPort};
-use trama_protocol::{
-    Channel, DeviceId, EngineCommand, GraphDescription, Input, MAX_GAIN, NodeId, NodeKind,
-    Notification,
-};
+use trama_io::midi::synth::{SynthOutputs, SynthPort};
+use trama_protocol::{Channel, EngineCommand, Input, Notification};
 
 #[derive(Args)]
 pub struct PlayArgs {
@@ -123,7 +123,8 @@ fn parse_cable(text: &str) -> Result<(u16, u16), String> {
     ))
 }
 
-/// The loudest monitoring goes, in decibels: [`MAX_GAIN`].
+/// The loudest monitoring goes, in decibels: about
+/// [`MAX_GAIN`](trama_protocol::MAX_GAIN).
 const MAX_MONITOR_DB: f32 = 12.0;
 
 fn parse_decibels(text: &str) -> Result<f32, String> {
@@ -136,10 +137,6 @@ fn parse_decibels(text: &str) -> Result<f32, String> {
     }
 }
 
-fn gain_from_decibels(db: f32) -> f32 {
-    10_f32.powf(db / 20.0).min(MAX_GAIN)
-}
-
 fn parse_rate(text: &str) -> Result<u32, String> {
     match text.parse() {
         Ok(rate @ (4 | 8 | 16 | 32)) => Ok(rate),
@@ -150,18 +147,17 @@ fn parse_rate(text: &str) -> Result<u32, String> {
 /// What the main thread (the core) receives.
 enum CoreMessage {
     Input(Input),
+    Gamepad(GamepadEvent),
     Quit,
 }
 
 pub fn run(args: PlayArgs) -> anyhow::Result<()> {
     let channel = Channel::from_number(args.channel).context("MIDI channel")?;
-    let gamepad = (!args.no_gamepad).then(|| DeviceId::new("joy"));
     let synth_port = match args.synth.as_str() {
         "none" => None,
         "virtual" => Some(SynthPort::Virtual("trama synth".into())),
         pattern => Some(SynthPort::Named(pattern.into())),
     };
-    let synth = synth_port.as_ref().map(|_| DeviceId::new("synth"));
 
     // The engine needs the sound card's sample rate, so pick the card first.
     let mut output = OutputDevice::find(args.audio.as_deref())?;
@@ -188,42 +184,25 @@ pub fn run(args: PlayArgs) -> anyhow::Result<()> {
             );
         }
     }
-    let monitoring = Monitoring::new(&args.connect);
     let sample_rate = output.sample_rate();
-    let pulses_per_step = 4 * PULSES_PER_QUARTER / args.rate;
-    let engine = Engine::new(EngineConfig {
-        sample_rate,
-        bpm: args.bpm,
-        midi_channel: channel,
-        pulses_per_step,
-        gate_pulses: (pulses_per_step / 2).max(1),
-    });
     let Engine {
         mut controller,
         mut processor,
         midi: engine_midi,
-    } = engine;
-    controller
-        .set_graph(&monitoring.graph)
-        .context("preparing the audio graph")?;
-    if let Some(db) = args.monitor {
-        for &level in &monitoring.levels {
-            send(
-                &mut controller,
-                EngineCommand::SetGain {
-                    node: level,
-                    gain: gain_from_decibels(db),
-                },
-            );
-            send(
-                &mut controller,
-                EngineCommand::SetMuted {
-                    node: level,
-                    muted: false,
-                },
-            );
-        }
-    }
+    } = Engine::new(EngineConfig::new(sample_rate));
+
+    let mut core = Core::new(args.bpm);
+    patch::add_sequencer(
+        &mut core,
+        StepSequencerSettings {
+            root: args.root,
+            scale: args.scale,
+            rate: args.rate,
+            channel,
+            ..StepSequencerSettings::default()
+        },
+    )?;
+    let monitoring = Monitoring::add(&mut core, &args.connect, args.monitor)?;
 
     let (core_tx, core_rx) = crossbeam_channel::unbounded();
     let mut subscribers: Vec<Sender<Notification>> = Vec::new();
@@ -253,27 +232,25 @@ pub fn run(args: PlayArgs) -> anyhow::Result<()> {
         println!("  monitor:  {}", monitoring.describe(args.monitor));
     }
 
-    let synth_output = match (&synth, synth_port) {
-        (Some(device), Some(port)) => {
-            let synth =
-                SynthOutput::start(device.clone(), port, sample_rate, engine_midi, subscribe())?;
-            println!(
-                "  synth:    {} (channel {})",
-                synth.port(),
-                channel.number()
-            );
-            Some(synth)
+    let synths = match synth_port {
+        Some(port) => {
+            let synths =
+                SynthOutputs::start(vec![(SYNTH, port)], sample_rate, engine_midi, subscribe())?;
+            for (_, port) in synths.ports() {
+                println!("  synth:    {port} (channel {})", channel.number());
+            }
+            patch::connect_synth(&mut core, SYNTH)?;
+            Some(synths)
         }
-        _ => None,
+        None => None,
     };
 
-    let pads_device = DeviceId::new("pads");
     let launchpad = match args.pads.as_deref() {
         Some("none") => None,
         chosen => {
             let tx = core_tx.clone();
             let connected = LaunchpadX::connect(
-                pads_device.clone(),
+                PADS,
                 chosen.unwrap_or(launchpad_x::DEFAULT_PORT),
                 move |input| {
                     let _ = tx.send(CoreMessage::Input(input));
@@ -283,6 +260,7 @@ pub fn run(args: PlayArgs) -> anyhow::Result<()> {
             match (connected, chosen) {
                 (Ok(launchpad), _) => {
                     println!("  pads:     {}", launchpad.port());
+                    patch::connect_pads(&mut core, PADS)?;
                     Some(launchpad)
                 }
                 (Err(error), None) => {
@@ -293,26 +271,30 @@ pub fn run(args: PlayArgs) -> anyhow::Result<()> {
             }
         }
     };
-    let pads = launchpad.as_ref().map(|_| pads_device);
 
-    let gamepads = match &gamepad {
-        Some(device) => {
-            let tx = core_tx.clone();
-            match Gamepads::start(device.clone(), move |input| {
-                let _ = tx.send(CoreMessage::Input(input));
-            }) {
-                Ok(gamepads) => {
-                    println!("  gamepads: on (plug one in at any time)");
-                    Some(gamepads)
-                }
-                Err(error) => {
-                    eprintln!("  gamepads: {error}; carrying on without them");
-                    None
-                }
+    let gamepads = if args.no_gamepad {
+        None
+    } else {
+        let tx = core_tx.clone();
+        match Gamepads::start(move |event| {
+            let _ = tx.send(CoreMessage::Gamepad(event));
+        }) {
+            Ok(gamepads) => {
+                println!("  gamepads: on (plug one in at any time)");
+                Some(gamepads)
+            }
+            Err(error) => {
+                eprintln!("  gamepads: {error}; carrying on without them");
+                None
             }
         }
-        None => None,
     };
+
+    if let Some(patch) = core.take_engine_patch() {
+        controller
+            .set_patch(&patch)
+            .context("preparing the engine patch")?;
+    }
 
     let quit = core_tx.clone();
     ctrlc::set_handler(move || {
@@ -334,46 +316,37 @@ pub fn run(args: PlayArgs) -> anyhow::Result<()> {
         args.rate,
         args.bpm
     );
-    print_controls(pads.is_some(), gamepad.is_some());
+    print_controls(launchpad.is_some(), gamepads.is_some());
 
-    let mut core = Core::new(CoreConfig {
-        pads,
-        gamepad,
-        synth,
-        midi_channel: channel,
-        root: args.root,
-        scale: args.scale,
-        bpm: args.bpm,
-    });
     let verbose = args.verbose;
-    dispatch(core.start(), &mut controller, &subscribers, verbose);
+    let mut run = Run {
+        core,
+        controller,
+        subscribers,
+        verbose,
+    };
+    let start = run.core.start();
+    run.dispatch(start);
     let mut input_report = InputReport::new();
     loop {
         match core_rx.recv_timeout(Duration::from_millis(1)) {
-            Ok(CoreMessage::Input(input)) => {
-                if verbose {
-                    println!(
-                        "input: {} {:?} {:?}",
-                        input.device, input.control, input.action
-                    );
+            Ok(CoreMessage::Input(input)) => run.input(input),
+            Ok(CoreMessage::Gamepad(GamepadEvent::Input(input))) => run.input(input),
+            Ok(CoreMessage::Gamepad(GamepadEvent::Connected { device, name })) => {
+                println!("  gamepad:  {name}, as {device}");
+                if !run.core.devices().contains(&device) {
+                    patch::connect_gamepad(&mut run.core, device)?;
                 }
-                dispatch(
-                    core.handle_input(&input),
-                    &mut controller,
-                    &subscribers,
-                    verbose,
-                );
+            }
+            Ok(CoreMessage::Gamepad(GamepadEvent::Disconnected { device })) => {
+                println!("  gamepad:  {device} unplugged");
             }
             Ok(CoreMessage::Quit) | Err(RecvTimeoutError::Disconnected) => break,
             Err(RecvTimeoutError::Timeout) => {}
         }
-        while let Some(event) = controller.next_event() {
-            dispatch(
-                core.handle_engine_event(event),
-                &mut controller,
-                &subscribers,
-                verbose,
-            );
+        while let Some(event) = run.controller.next_event() {
+            let out = run.core.handle_engine_event(event);
+            run.dispatch(out);
         }
         if let Some(stats) = audio.input_stats() {
             input_report.check(stats);
@@ -381,34 +354,26 @@ pub fn run(args: PlayArgs) -> anyhow::Result<()> {
     }
 
     println!("\nstopping...");
-    dispatch(core.shutdown(), &mut controller, &subscribers, verbose);
-    for &level in &monitoring.levels {
-        send(
-            &mut controller,
-            EngineCommand::SetMuted {
-                node: level,
-                muted: true,
-            },
-        );
-    }
+    let out = run.core.shutdown();
+    run.dispatch(out);
     if let Some(stats) = audio.input_stats() {
         println!(
             "  audio in: {} underruns, {} overruns",
             stats.underruns, stats.overruns
         );
     }
-    // Give the engine a few blocks to process the stop and release the last
-    // note before the sound card closes.
+    // Give the engine a few blocks to process the stop, release the last
+    // note and fade monitoring out before the sound card closes.
     thread::sleep(Duration::from_millis(100));
     drop(audio);
     // Closing the notification channels lets the adapters finish: the
-    // Launchpad goes back to its normal mode, the synth sends what is left.
-    drop(subscribers);
+    // Launchpad goes back to its normal mode, the synths get what is left.
+    drop(run);
     if let Some(launchpad) = launchpad {
         launchpad.join();
     }
-    if let Some(synth) = synth_output {
-        synth.join();
+    if let Some(synths) = synths {
+        synths.join();
     }
     if let Some(gamepads) = gamepads {
         gamepads.stop();
@@ -416,81 +381,52 @@ pub fn run(args: PlayArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The core at work, and where what it says goes.
+struct Run {
+    core: Core,
+    controller: EngineController,
+    subscribers: Vec<Sender<Notification>>,
+    verbose: bool,
+}
+
+impl Run {
+    fn input(&mut self, input: Input) {
+        if self.verbose {
+            println!(
+                "input: {} {:?} {:?}",
+                input.device, input.control, input.action
+            );
+        }
+        let out = self.core.handle_input(&input);
+        self.dispatch(out);
+    }
+
+    /// Sends the engine the new patch, if the core has one, then `outputs`.
+    fn dispatch(&mut self, outputs: Vec<Output>) {
+        if let Some(patch) = self.core.take_engine_patch() {
+            if let Err(error) = self.controller.set_patch(&patch) {
+                eprintln!("engine: {error}");
+            }
+        }
+        for output in outputs {
+            match output {
+                Output::Engine(command) => send(&mut self.controller, command),
+                Output::Notify(notification) => {
+                    if self.verbose && !matches!(notification, Notification::Light { .. }) {
+                        println!("change: {notification:?}");
+                    }
+                    for subscriber in &self.subscribers {
+                        let _ = subscriber.send(notification);
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn send(engine: &mut EngineController, command: EngineCommand) {
     if engine.send(command).is_err() {
         eprintln!("engine queue full; dropped {command:?}");
-    }
-}
-
-/// The patch `trama play` builds from `--connect`: each input channel goes
-/// through a gain of its own, and its cables meet at a monitoring level for
-/// each output channel. The levels start muted.
-struct Monitoring {
-    graph: GraphDescription,
-    /// The monitoring level of each output channel in use.
-    levels: Vec<NodeId>,
-    /// Input and output channels, from 1, sorted and without repeats.
-    cables: Vec<(u16, u16)>,
-}
-
-impl Monitoring {
-    /// `cables` count channels from 1.
-    fn new(cables: &[(u16, u16)]) -> Monitoring {
-        // Ids by role, so each node is easy to find in a description.
-        let id = |role: u32, channel: u16| NodeId(role << 16 | u32::from(channel));
-        let mut graph = GraphDescription::new();
-        let mut inputs = BTreeMap::new();
-        let mut levels = BTreeMap::new();
-        let cables: BTreeSet<(u16, u16)> = cables.iter().copied().collect();
-        for &(from, to) in &cables {
-            let (from, to) = (from - 1, to - 1);
-            let gain = *inputs.entry(from).or_insert_with(|| {
-                let input = graph.add(id(1, from), NodeKind::AudioInput { channel: from });
-                let gain = graph.add(
-                    id(2, from),
-                    NodeKind::Gain {
-                        gain: 1.0,
-                        muted: false,
-                    },
-                );
-                graph.connect(input.jack(0), gain.jack(0));
-                gain
-            });
-            let level = *levels.entry(to).or_insert_with(|| {
-                let level = graph.add(
-                    id(3, to),
-                    NodeKind::Gain {
-                        gain: 1.0,
-                        muted: true,
-                    },
-                );
-                let output = graph.add(id(4, to), NodeKind::AudioOutput { channel: to });
-                graph.connect(level.jack(0), output.jack(0));
-                level
-            });
-            graph.connect(gain.jack(0), level.jack(0));
-        }
-        Monitoring {
-            graph,
-            levels: levels.into_values().collect(),
-            cables: cables.into_iter().collect(),
-        }
-    }
-
-    fn describe(&self, db: Option<f32>) -> String {
-        if self.levels.is_empty() {
-            return "nothing connected (see --connect)".into();
-        }
-        let cables: Vec<String> = self
-            .cables
-            .iter()
-            .map(|(from, to)| format!("{from}→{to}"))
-            .collect();
-        let volume = match db {
-            Some(db) => format!("{db:+} dB"),
-            None => "muted (turn it up with --monitor)".into(),
-        };
-        format!("{}, {volume}", cables.join(" "))
     }
 }
 
@@ -539,27 +475,6 @@ impl InputReport {
     }
 }
 
-fn dispatch(
-    outputs: Vec<Output>,
-    engine: &mut EngineController,
-    subscribers: &[Sender<Notification>],
-    verbose: bool,
-) {
-    for output in outputs {
-        match output {
-            Output::Engine(command) => send(engine, command),
-            Output::Notify(notification) => {
-                if verbose && !matches!(notification, Notification::Light { .. }) {
-                    println!("change: {notification:?}");
-                }
-                for subscriber in subscribers {
-                    let _ = subscriber.send(notification.clone());
-                }
-            }
-        }
-    }
-}
-
 fn print_controls(pads: bool, gamepad: bool) {
     println!();
     if pads {
@@ -584,7 +499,8 @@ fn print_controls(pads: bool, gamepad: bool) {
 
 #[cfg(test)]
 mod tests {
-    use trama_engine::EngineConfig;
+    use trama_core::modules::gain::gain_from_decibels;
+    use trama_protocol::MAX_GAIN;
 
     use super::*;
 
@@ -608,70 +524,5 @@ mod tests {
         assert_eq!(gain_from_decibels(0.0), 1.0);
         assert!((gain_from_decibels(-6.0) - 0.501).abs() < 0.001);
         assert!(gain_from_decibels(MAX_MONITOR_DB) <= MAX_GAIN);
-    }
-
-    /// Runs `frames` frames of a steady `level` on every input channel and
-    /// returns the last output frame.
-    fn last_frame(engine: &mut Engine, inputs: usize, outputs: usize, level: f32) -> Vec<f32> {
-        let frames = 2048;
-        let input = vec![level; frames * inputs];
-        let mut output = vec![f32::NAN; frames * outputs];
-        engine
-            .processor
-            .process(&input, inputs, &mut output, outputs, Instant::now());
-        output[(frames - 1) * outputs..].to_vec()
-    }
-
-    #[test]
-    fn monitoring_starts_muted() {
-        let monitoring = Monitoring::new(&[(1, 1), (1, 2)]);
-        let mut engine = Engine::new(EngineConfig::new(48_000));
-        engine.controller.set_graph(&monitoring.graph).unwrap();
-        assert_eq!(last_frame(&mut engine, 1, 2, 0.5), vec![0.0, 0.0]);
-    }
-
-    #[test]
-    fn monitoring_plays_each_cable_at_its_volume() {
-        // A stereo pair, plus input 3 on both sides.
-        let monitoring = Monitoring::new(&[(1, 1), (2, 2), (3, 1), (3, 2), (1, 1)]);
-        assert_eq!(monitoring.cables, vec![(1, 1), (2, 2), (3, 1), (3, 2)]);
-        assert_eq!(monitoring.levels.len(), 2);
-        let mut engine = Engine::new(EngineConfig::new(48_000));
-        engine.controller.set_graph(&monitoring.graph).unwrap();
-        for &level in &monitoring.levels {
-            send(
-                &mut engine.controller,
-                EngineCommand::SetGain {
-                    node: level,
-                    gain: 0.5,
-                },
-            );
-            send(
-                &mut engine.controller,
-                EngineCommand::SetMuted {
-                    node: level,
-                    muted: false,
-                },
-            );
-        }
-        let frames = 2048;
-        let input: Vec<f32> = (0..frames).flat_map(|_| [0.1, 0.2, 0.4]).collect();
-        let mut output = vec![f32::NAN; frames * 4];
-        engine
-            .processor
-            .process(&input, 3, &mut output, 4, Instant::now());
-        let last = &output[(frames - 1) * 4..];
-        assert!((last[0] - (0.1 + 0.4) * 0.5).abs() < 1e-6);
-        assert!((last[1] - (0.2 + 0.4) * 0.5).abs() < 1e-6);
-        assert_eq!(&last[2..], &[0.0, 0.0], "unconnected outputs stay silent");
-    }
-
-    #[test]
-    fn nothing_connected_is_silence() {
-        let monitoring = Monitoring::new(&[]);
-        assert!(monitoring.levels.is_empty());
-        let mut engine = Engine::new(EngineConfig::new(48_000));
-        engine.controller.set_graph(&monitoring.graph).unwrap();
-        assert_eq!(last_frame(&mut engine, 2, 2, 0.5), vec![0.0, 0.0]);
     }
 }
