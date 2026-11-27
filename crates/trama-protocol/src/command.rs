@@ -2,8 +2,7 @@
 
 //! `Command`: what the musician wants, independent of any device.
 
-/// What the musician wants. Mappings turn `Input`s into these; the web page
-/// and other computers will send them directly.
+/// Mappings turn `Input`s into these.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Command {
     Play,

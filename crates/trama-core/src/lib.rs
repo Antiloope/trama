@@ -9,14 +9,11 @@
 //!    (or receive a `Command` directly);
 //! 2. apply the `Command` to the session;
 //! 3. tell the engine what it needs to know ([`Output::Engine`]);
-//! 4. announce what changed ([`Output::Notify`]), so lights and screens
-//!    update.
+//! 4. announce what changed ([`Output::Notify`]), so lights update.
 //!
 //! The core has no devices, no audio and no threads of its own: every method
 //! takes a message and returns the messages to send. That makes it plain
 //! logic, easy to test.
-//!
-//! See `docs/architecture.md`, sections 2, 3 and 7.
 
 pub mod mapping;
 pub mod music;
@@ -33,21 +30,16 @@ use trama_protocol::{
     midi::{CC_ALL_NOTES_OFF, CC_MODULATION},
 };
 
-/// Something the core wants sent.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Output {
-    /// To the engine.
     Engine(EngineCommand),
-    /// To every adapter (and, later, every screen).
+    /// To every adapter.
     Notify(Notification),
 }
 
-/// How the core is set up.
 #[derive(Clone, Debug)]
 pub struct CoreConfig {
-    /// The pad grid, if there is one.
     pub pads: Option<DeviceId>,
-    /// The gamepad, if there is one.
     pub gamepad: Option<DeviceId>,
     /// The synth the sequencer plays, for live controls such as pitch bend.
     pub synth: Option<DeviceId>,
@@ -260,7 +252,6 @@ impl Core {
         }
     }
 
-    /// Tells the engine and everyone else what step `step` plays now.
     fn announce_step(&self, step: usize, out: &mut Vec<Output>) {
         let note = self.session.note_at(step);
         let step = step as u8;

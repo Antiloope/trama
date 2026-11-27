@@ -5,8 +5,6 @@
 //! This is the only crate that knows every other one. Its job is to read the
 //! command line, start the adapters, the engine and the core, and connect
 //! them with queues and channels.
-//!
-//! See `docs/architecture.md`, sections 5 and 6.
 
 mod doctor;
 mod play;

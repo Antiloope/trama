@@ -1,0 +1,105 @@
+# Contributing to Trama
+
+## Setting up
+
+1. Install Rust with [rustup](https://rustup.rs). `rust-toolchain.toml`
+   picks the latest stable release with `rustfmt` and `clippy`.
+2. Install the system libraries:
+   - Fedora: `sudo dnf install alsa-lib-devel pipewire-devel clang-devel systemd-devel`
+     (ALSA for MIDI, PipeWire for audio, clang to generate PipeWire's Rust
+     bindings, systemd's libudev for gamepads);
+   - macOS: `xcode-select --install`.
+
+## Everyday commands
+
+| Command                                     | What it does                               |
+|---------------------------------------------|--------------------------------------------|
+| `cargo run -- doctor`                       | list the audio outputs, MIDI ports and gamepads Trama finds |
+| `cargo run --release -- play`               | play, with an optimized build              |
+| `cargo test --workspace`                    | every test in every crate                  |
+| `cargo fmt --all`                           | format the code                            |
+| `cargo clippy --workspace --all-targets -- -D warnings` | lint                           |
+| `cargo deny check`                          | check every dependency's license (install it with `cargo install cargo-deny`) |
+| `scripts/check-docs.sh`                     | check the documentation rules below        |
+
+Debug builds are partly optimized (see `[profile.dev]` in `Cargo.toml`),
+because audio code without optimizations can be too slow to keep time.
+`Cargo.lock` is committed so both systems build with the same library
+versions.
+
+## Tests
+
+From fastest to slowest:
+
+1. **Unit tests**, next to the code they test: MIDI encoding, scales and
+   note names, Launchpad bytes, gamepad events, the clock map.
+2. **The core as a black box** (`crates/trama-core/tests`): inputs in,
+   engine commands and notifications out.
+3. **The engine offline** (`crates/trama-engine/tests/offline.rs`): it runs
+   without a sound card, and the tests check which MIDI comes out on which
+   sample, for several block sizes.
+4. **Real-time safety** (`crates/trama-engine/tests/realtime.rs`): the
+   processor runs under `assert_no_alloc`, which aborts the test if the
+   audio path allocates.
+5. **End to end, without hardware**: `cargo run -p trama-io --example
+   fake_gear` creates a pretend Launchpad and synth on virtual MIDI ports
+   (Linux and macOS). Point `trama play` at them (`--pads "Fake LPX" --synth
+   "Fake Synth" --no-gamepad`) and it presses pads, plays, stops, and
+   reports the notes the synth got and how steady the MIDI clock was.
+6. **With the gear**: `trama doctor`, then `trama play` with the real
+   devices.
+
+CI (`.github/workflows/ci.yml`) runs formatting, clippy and tests 1 to 4 on
+Linux and macOS for every push, and checks licenses. Tests 5 and 6 need a
+MIDI system and hardware, so they are run by hand.
+
+## Documentation
+
+The repository describes Trama as it is today. Plans, ideas, bugs and
+things to try live in [GitHub issues](https://github.com/Antiloope/trama/issues),
+labelled `enhancement`, `bug` or `testing`.
+
+| Where                       | What goes there                                                         | What does not                          |
+|-----------------------------|-------------------------------------------------------------------------|----------------------------------------|
+| Names in the code           | The first documentation: types, functions and variables that explain themselves | —                              |
+| `//!` on a crate or module  | What it is responsible for and its rules, in a few lines                | History, links to document sections    |
+| `///` on public items       | What the signature cannot say: units, ranges, edge cases, invariants    | The name restated                      |
+| `//` inside a function      | A non-obvious *why*                                                     | *What* the code does, to-do notes, plans |
+| `README.md`                 | What Trama is, requirements, how to build, run and play                 | Project status, phases                 |
+| `CONTRIBUTING.md`           | How to work on the repository                                           | —                                      |
+| `docs/architecture.md`      | How Trama is built: layers, messages, time, threads, crates             | Features that do not exist             |
+| `docs/decisions.md`         | Why it is built this way: decisions the code reflects, in the present tense | Decisions about work not done      |
+| GitHub issues               | Plans, ideas, bugs, things to try                                       | —                                      |
+
+A few more rules:
+
+- No to-do or fix-me comments: open an issue.
+- Code never points at issues, plans or numbered document sections.
+- A change that alters behaviour updates the README and `docs/` too.
+
+`scripts/check-docs.sh` looks for the words that usually break these rules
+(project phases, reminders, section numbers) in every tracked file. Run it
+before opening a pull request. Claude Code runs it automatically: the hooks
+in `.claude/settings.json` check each file an agent edits, and every changed
+file before the agent finishes. Agents read the same rules from `AGENTS.md`
+(`CLAUDE.md` imports it).
+
+## Code conventions
+
+- Code, comments, docs, commit messages and issues are in English.
+- Every source file starts with `// SPDX-License-Identifier: GPL-3.0-or-later`.
+- Trama is GPL-3.0-or-later, so every dependency must be compatible (MIT,
+  Apache-2.0, BSD, ISC, Zlib, MPL-2.0, LGPL, GPL-2.0-or-later, ...).
+  `cargo deny check` enforces the list in `deny.toml`; check a new license
+  before adding it there.
+- No `unsafe`: the workspace lints forbid it.
+- Crates depend on each other only as `docs/architecture.md` describes.
+- Nothing on the audio thread may allocate, lock, block, print or touch
+  files.
+
+## Changes
+
+- One branch and one pull request per change.
+- The pull request says what changed and how it was tested, including what
+  could not be tested (for example, hardware that was not connected).
+- CI must pass before merging.

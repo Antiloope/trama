@@ -20,7 +20,6 @@ pub struct AudioReport {
     pub outputs: Vec<(String, bool)>,
 }
 
-/// Lists the output devices of the default audio system.
 pub fn list_outputs() -> Result<AudioReport> {
     let host = cpal::default_host();
     let default = host.default_output_device().map(|d| d.to_string());
@@ -39,7 +38,7 @@ pub fn list_outputs() -> Result<AudioReport> {
     })
 }
 
-/// An output device, chosen but not started yet.
+/// An output device that has been chosen but not started.
 pub struct OutputDevice {
     device: Device,
     config: StreamConfig,

@@ -9,7 +9,6 @@
 pub struct Channel(u8);
 
 impl Channel {
-    /// Channel 1, the usual default.
     pub const ONE: Channel = Channel(0);
 
     /// The channel people call `number` (1 to 16).
@@ -28,19 +27,14 @@ impl Channel {
     }
 }
 
-/// Pitch bend value meaning "no bend".
 pub const PITCH_BEND_CENTER: u16 = 8192;
 
-/// Highest pitch bend value (14 bits).
 pub const PITCH_BEND_MAX: u16 = 16383;
 
-/// Controller number of the modulation wheel.
 pub const CC_MODULATION: u8 = 1;
 
-/// Controller number of "all notes off".
 pub const CC_ALL_NOTES_OFF: u8 = 123;
 
-/// A MIDI message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MidiMessage {
     NoteOn {
@@ -85,7 +79,6 @@ impl MidiMessage {
         MidiMessage::PitchBend { channel, value }
     }
 
-    /// The bytes of this message.
     pub fn encode(&self) -> EncodedMidi {
         let data_7bit = |value: u8| value & 0x7F;
         match *self {

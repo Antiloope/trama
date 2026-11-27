@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! The real-time audio engine.
+//! The real-time engine.
 //!
-//! The engine runs the audio graph one small block of samples at a time, and
-//! it keeps Trama's master clock by counting those samples. For now the
-//! graph is empty (the engine outputs silence) and the engine's job is
-//! keeping time: it runs the transport, sends MIDI clock and plays the step
+//! The engine runs one small block of samples at a time and keeps Trama's
+//! master clock by counting them. It writes silence: its job is keeping
+//! time. It runs the transport, sends MIDI clock and plays the step
 //! sequencer, all placed on exact samples.
 //!
 //! It is split in two halves that talk through lock-free queues:
@@ -20,8 +19,6 @@
 //!
 //! The engine knows nothing about sound cards or devices: it is just "audio
 //! in, audio out". That is what lets tests run it offline.
-//!
-//! See `docs/architecture.md`, sections 4 and 5.
 
 mod processor;
 
@@ -35,11 +32,9 @@ pub const PULSES_PER_QUARTER: u32 = 24;
 /// How the engine is set up. It cannot change while running.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EngineConfig {
-    /// Samples per second of the sound card.
     pub sample_rate: u32,
     /// Tempo at start, in beats per minute.
     pub bpm: f64,
-    /// Channel the sequencer plays on.
     pub midi_channel: Channel,
     /// Clock pulses per sequencer step: 6 for sixteenth notes, 12 for
     /// eighth notes.
@@ -106,7 +101,6 @@ impl EngineController {
             .map_err(|rtrb::PushError::Full(c)| c)
     }
 
-    /// The next event the processor reported, if any.
     pub fn next_event(&mut self) -> Option<EngineEvent> {
         self.events.pop().ok()
     }

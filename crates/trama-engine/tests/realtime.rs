@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! The audio thread must never allocate memory (see
-//! `docs/architecture.md`, section 5). This test replaces the memory
-//! allocator with one that aborts the test if anything allocates inside
-//! `assert_no_alloc`.
+//! The audio thread must never allocate memory. This test replaces the
+//! memory allocator with one that aborts the test if anything allocates
+//! inside `assert_no_alloc`.
 
 use std::time::Instant;
 
