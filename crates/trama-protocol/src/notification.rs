@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! `Notification`: what changed. Some are about the session, for anything
-//! that shows it; others are addressed to one device, so adapters stay
-//! simple translators.
+//! `Notification`: what changed. Some are about a module, for anything that
+//! shows it; others are addressed to one device, so adapters stay simple
+//! translators.
 
 use crate::engine::StepNote;
-use crate::input::{Control, DeviceId};
+use crate::input::Control;
 use crate::midi::MidiMessage;
+use crate::name::{DeviceId, ModuleId};
 
 /// A color a controller can show. Adapters pick the closest one their
 /// device has.
@@ -50,14 +51,22 @@ impl Light {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Notification {
-    /// The transport started or stopped, or the tempo changed.
-    Transport { playing: bool, bpm: f64 },
-    /// Step `step` now holds `note`.
-    Step { step: u8, note: Option<StepNote> },
-    /// The sequencer is on step `step`, or stopped if `None`.
-    Playhead { step: Option<u8> },
+    /// Clock `clock` started or stopped, or its tempo changed.
+    Transport {
+        clock: ModuleId,
+        playing: bool,
+        bpm: f64,
+    },
+    /// Step `step` of sequencer `module` now holds `note`.
+    Step {
+        module: ModuleId,
+        step: u8,
+        note: Option<StepNote>,
+    },
+    /// Sequencer `module` is on step `step`, or stopped if `None`.
+    Playhead { module: ModuleId, step: Option<u8> },
     Light {
         device: DeviceId,
         control: Control,

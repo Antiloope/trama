@@ -1,38 +1,26 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! `Command`: what the musician wants, independent of any device.
+//! `Command`: what reaches an input of a module, independent of any device.
 
-/// Mappings turn `Input`s into these.
+use crate::input::Action;
+use crate::name::ModuleId;
+
+/// One cell of an input or output shaped like a grid, counted from the
+/// bottom-left corner, starting at 0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Cell {
+    pub row: u8,
+    pub column: u8,
+}
+
+/// Something for input `input` of module `module`. Connections turn the
+/// `Input`s of devices into these.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Command {
-    Play,
-    Stop,
-    TogglePlay,
-    SetTempo {
-        bpm: f64,
-    },
-    /// Change the tempo by `bpm` (negative slows down).
-    NudgeTempo {
-        bpm: f64,
-    },
-    /// Put scale degree `degree` on step `step`, or clear the step if it
-    /// already holds that degree. `velocity` goes from 0.0 to 1.0.
-    ToggleStep {
-        step: u8,
-        degree: u8,
-        velocity: f32,
-    },
-    ClearPattern,
-    /// Move the whole pattern up or down by `octaves`.
-    ShiftOctave {
-        octaves: i8,
-    },
-    /// Bend the synth's pitch, from -1.0 to 1.0.
-    SetPitchBend {
-        amount: f32,
-    },
-    /// The synth's modulation wheel, from 0.0 to 1.0.
-    SetModulation {
-        amount: f32,
-    },
+pub struct Command {
+    pub module: ModuleId,
+    /// The input's name, as the module's definition gives it.
+    pub input: &'static str,
+    /// The cell, for an input shaped like a grid.
+    pub cell: Option<Cell>,
+    pub action: Action,
 }

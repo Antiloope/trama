@@ -2,16 +2,19 @@
 
 //! Gamepads and joysticks, through gilrs (evdev on Linux, IOKit on macOS).
 //!
-//! Controls are named after the Xbox layout: `south` is A, `east` is B, and
-//! so on. Sticks go from -1.0 to 1.0 (up is positive); triggers from 0.0 to
-//! 1.0. gilrs already applies a dead zone, so a stick at rest is exactly 0.
+//! Each gamepad is a device of its own, named `gamepad-1`, `gamepad-2` and
+//! so on, in the order the system first sees them; one plugged in again
+//! keeps its name. Controls are named after the Xbox layout: `south` is A,
+//! `east` is B, and so on. Sticks go from -1.0 to 1.0 (up is positive);
+//! triggers from 0.0 to 1.0. gilrs already applies a dead zone, so a stick
+//! at rest is exactly 0.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use gilrs::{Axis, Button, EventType, Gilrs};
+use gilrs::{Axis, Button, EventType, GamepadId, Gilrs};
 use trama_protocol::{Action, Control, DeviceId, Input};
 
 use crate::error::{Error, Result};
@@ -110,6 +113,26 @@ fn axis_name(axis: Axis) -> Option<&'static str> {
     })
 }
 
+/// What the gamepads report.
+#[derive(Clone, Debug, PartialEq)]
+pub enum GamepadEvent {
+    /// Gamepad `device` is there, when reading starts or when it is
+    /// plugged in. `name` is what the system calls it.
+    Connected {
+        device: DeviceId,
+        name: String,
+    },
+    Disconnected {
+        device: DeviceId,
+    },
+    Input(Input),
+}
+
+/// The device the gamepad gilrs numbers `id` is.
+fn device(id: GamepadId) -> Option<DeviceId> {
+    DeviceId::new(&format!("gamepad-{}", usize::from(id) + 1))
+}
+
 /// Reads every connected gamepad on its own thread.
 pub struct Gamepads {
     thread: JoinHandle<()>,
@@ -117,11 +140,11 @@ pub struct Gamepads {
 }
 
 impl Gamepads {
-    /// Starts reading. Every event from any gamepad becomes an [`Input`] from
-    /// `device`, passed to `on_input`. Gamepads plugged in later work too.
-    pub fn start<F>(device: DeviceId, mut on_input: F) -> Result<Gamepads>
+    /// Starts reading, and passes `on_event` every gamepad there is, then
+    /// every input and every gamepad plugged in or out.
+    pub fn start<F>(mut on_event: F) -> Result<Gamepads>
     where
-        F: FnMut(Input) + Send + 'static,
+        F: FnMut(GamepadEvent) + Send + 'static,
     {
         let stop = Arc::new(AtomicBool::new(false));
         let (ready_tx, ready_rx) = crossbeam_channel::bounded(1);
@@ -140,19 +163,41 @@ impl Gamepads {
                         return;
                     }
                 };
+                for (id, pad) in gilrs.gamepads() {
+                    if let Some(device) = device(id) {
+                        on_event(GamepadEvent::Connected {
+                            device,
+                            name: pad.name().to_string(),
+                        });
+                    }
+                }
                 while !thread_stop.load(Ordering::Relaxed) {
                     let Some(event) = gilrs.next_event_blocking(Some(Duration::from_millis(50)))
                     else {
                         continue;
                     };
-                    if let Some((control, action)) =
-                        PadEvent::from_gilrs(event.event).and_then(translate)
-                    {
-                        on_input(Input {
-                            device: device.clone(),
-                            control,
-                            action,
-                        });
+                    let Some(device) = device(event.id) else {
+                        continue;
+                    };
+                    match event.event {
+                        EventType::Connected => on_event(GamepadEvent::Connected {
+                            device,
+                            name: gilrs.gamepad(event.id).name().to_string(),
+                        }),
+                        EventType::Disconnected => {
+                            on_event(GamepadEvent::Disconnected { device });
+                        }
+                        other => {
+                            if let Some((control, action)) =
+                                PadEvent::from_gilrs(other).and_then(translate)
+                            {
+                                on_event(GamepadEvent::Input(Input {
+                                    device,
+                                    control,
+                                    action,
+                                }));
+                            }
+                        }
                     }
                 }
             })
