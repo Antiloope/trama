@@ -69,20 +69,26 @@ mixed. Trama opens every channel an input has, but on PipeWire `default`
 always has two: to reach the others, name the device as `trama doctor`
 lists it.
 
-The input and the output must run on one clock:
+Any input plays through any output. Each device keeps time with a clock
+of its own, and two clocks drift apart by a few samples a second, so an
+input on another clock than the output is resampled to it:
 
-- **Linux with PipeWire**: any input and output.
-- **Linux without PipeWire**: the input of the output device itself.
-- **macOS**: the input of the output device itself. To use, say, the
-  built-in microphone with headphones, join both in an aggregate device in
-  Audio MIDI Setup and choose it with `--audio` and `--audio-in`. macOS
-  also asks whether the terminal may use the microphone; until it may, the
-  input is silent, and Trama says so.
+- **Linux with PipeWire**: every input and output run on one clock, and
+  nothing is resampled.
+- **Linux without PipeWire, and macOS**: the input of the output device
+  itself shares its clock. Any other input, such as the built-in
+  microphone with headphones, is resampled, and `trama play` says so. It
+  keeps the sample rate its device runs at, so an input at 44.1 kHz plays
+  through an output at 48 kHz.
 
-Between input and output there is a delay of a few blocks. At 48 kHz a
-block of 1024 frames lasts 21 ms; `--block-size 128` asks for blocks of
-under 3 ms, at the cost of more CPU. Trama reports underruns and overruns
-(input that came too late or too early) as they happen.
+macOS also asks whether the terminal may use the microphone; until it may,
+the input is silent, and Trama says so.
+
+Between input and output there is a delay of a few blocks, and about one
+more when the input is resampled. At 48 kHz a block of 1024 frames lasts
+21 ms; `--block-size 128` asks for blocks of under 3 ms, at the cost of
+more CPU. Trama reports underruns and overruns (input that came too late
+or too early) as they happen.
 
 Useful options (`cargo run -- play --help` lists them all):
 

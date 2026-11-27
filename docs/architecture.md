@@ -288,17 +288,52 @@ waits for it to fill again. Input that finds the ring full, or that piles
 up beyond the cushion while the output was not reading, is dropped (an
 **overrun**). `trama play` reports both, at most once a second.
 
-The cushion keeps input and output in step only if they share a clock
-(see decisions.md). With PipeWire they always do: cpal puts both streams
-in one group, and PipeWire runs them in the same cycle whatever the
-devices. Elsewhere the input must be the output device itself; on macOS,
-Audio MIDI Setup can join several devices into one aggregate device.
+With PipeWire, input and output always share a clock: cpal puts both
+streams in one group, and PipeWire runs them in the same cycle whatever
+the devices. Elsewhere only the input of the output device itself does.
 PipeWire also offers each output as an input that records what plays on
 it; Trama leaves those out, so it never records itself.
 
-The input opens with every channel the device offers, at the output's
-sample rate and block size. `--block-size` asks the system for smaller
-blocks, which shortens the delay between input and output.
+The input opens with every channel the device offers and the output's
+block size. `--block-size` asks the system for smaller blocks, which
+shortens the delay between input and output. On the output's clock it
+opens at the output's sample rate, and the cushion is all there is.
+
+### An input on a clock of its own
+
+Two clocks drift apart, typically by around 50 parts per million: the
+input arrives a few samples a second faster or slower than the output
+plays it, and the cushion would fill up or run dry every few minutes. So
+an input on a clock of its own goes through a resampler on its way to the
+cushion (see decisions.md):
+
+```
+ input stream ──▶ resampler ──▶ cushion ──▶ output stream ──▶ engine
+                      ▲                          │
+                      └──────── correction ──────┘
+```
+
+- The input opens at the sample rate its device runs at, and the
+  resampler (rubato's sinc resampler) converts it to the output's: 44.1
+  kHz into 48 kHz, or 48 kHz into 48 kHz on another clock. The engine
+  receives blocks of input at the output's rate either way.
+- The output callback measures the cushion's fill and steers the ratio,
+  stretching or squeezing the input by the drift, up to 0.5 %. Input
+  blocks arrive at moments that slide slowly past the reads, so the fill
+  it measures counts what the input has captured since its last block, as
+  if input arrived sample by sample. The correction travels to the input
+  callback through an atomic, like the counters.
+- A slow control loop keeps that fill an input block and a quarter above
+  the cushion, so the ring does not run dry just before a block arrives,
+  when it holds least. It settles in about fifteen seconds and smooths out
+  the jitter of callbacks, so the pitch never wobbles audibly.
+
+The resampler and its buffers are made when the stream starts; on the
+audio thread it never allocates, and its work grows only with the block.
+`crates/trama-io/src/audio/clocks_apart.rs` runs both streams offline on
+clocks 100 ppm apart, and from 44.1 kHz to 48 kHz, for minutes: no
+underruns or overruns once settled, a sine stays a clean sine, and the
+resampler never allocates.
 
 ## Time
 
@@ -434,6 +469,7 @@ The main outside libraries:
 |---------------------|----------------|-----------------------------------------------|
 | `rtrb`              | engine, io     | lock-free queues to and from the audio threads |
 | `cpal`              | io             | the sound card (PipeWire, ALSA, CoreAudio)    |
+| `rubato`            | io             | resampling an input on a clock of its own     |
 | `midir`             | io             | MIDI ports (ALSA, CoreMIDI)                   |
 | `gilrs`             | io             | gamepads (evdev, IOKit)                       |
 | `crossbeam-channel` | io, program    | channels between normal threads               |

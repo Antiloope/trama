@@ -13,7 +13,11 @@ crossbeam-channel = "0.5.17"
 gilrs = "0.11.2"
 midir = "0.11.2"
 rtrb = "0.4.1"
+rubato = { version = "5.1.0", default-features = false }
 trama-protocol.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+assert_no_alloc = "1.1.2"
