@@ -56,6 +56,8 @@ impl std::error::Error for GraphError {}
 pub(crate) struct PreparedGraph {
     /// In the order they run: every node after the nodes it listens to.
     nodes: Vec<PreparedNode>,
+    /// Each node's place in `nodes`, sorted by id, to find it quickly.
+    by_id: Vec<(NodeId, usize)>,
     /// One buffer of [`MAX_FRAMES`] per output jack, end to end.
     buffers: Vec<f32>,
     /// For every input jack, the range of `sources` it sums.
@@ -67,6 +69,7 @@ pub(crate) struct PreparedGraph {
 }
 
 struct PreparedNode {
+    id: NodeId,
     process: Process,
     /// The range of `input_jacks` that belongs to this node.
     inputs: Range<usize>,
@@ -77,7 +80,71 @@ struct PreparedNode {
 enum Process {
     AudioInput { channel: usize },
     AudioOutput { channel: usize },
-    Gain { level: f32 },
+    Gain(GainState),
+}
+
+struct GainState {
+    gain: f32,
+    muted: bool,
+    ramp: Ramp,
+}
+
+impl GainState {
+    fn new(gain: f32, muted: bool) -> GainState {
+        let gain = gain.clamp(0.0, MAX_GAIN);
+        GainState {
+            gain,
+            muted,
+            ramp: Ramp::at(if muted { 0.0 } else { gain }),
+        }
+    }
+
+    fn level(&self) -> f32 {
+        if self.muted { 0.0 } else { self.gain }
+    }
+}
+
+/// A level that glides to a new target in a fixed number of frames, so a
+/// change does not click.
+struct Ramp {
+    current: f32,
+    target: f32,
+    step: f32,
+    frames_left: u32,
+}
+
+impl Ramp {
+    fn at(level: f32) -> Ramp {
+        Ramp {
+            current: level,
+            target: level,
+            step: 0.0,
+            frames_left: 0,
+        }
+    }
+
+    fn glide_to(&mut self, target: f32, frames: u32) {
+        self.target = target;
+        if target == self.current || frames == 0 {
+            self.current = target;
+            self.frames_left = 0;
+        } else {
+            self.frames_left = frames;
+            self.step = (target - self.current) / frames as f32;
+        }
+    }
+
+    fn next(&mut self) -> f32 {
+        if self.frames_left > 0 {
+            self.frames_left -= 1;
+            self.current = if self.frames_left == 0 {
+                self.target
+            } else {
+                self.current + self.step
+            };
+        }
+        self.current
+    }
 }
 
 /// The interleaved audio around one piece of a block.
@@ -96,10 +163,65 @@ impl PreparedGraph {
     pub(crate) fn empty() -> PreparedGraph {
         PreparedGraph {
             nodes: Vec::new(),
+            by_id: Vec::new(),
             buffers: Vec::new(),
             input_jacks: Vec::new(),
             sources: Vec::new(),
             gathered: Vec::new(),
+        }
+    }
+
+    /// Sets the gain of node `id`, ramped over `ramp` frames. Does nothing if
+    /// `id` is not a gain or `gain` is not a number.
+    pub(crate) fn set_gain(&mut self, id: NodeId, gain: f32, ramp: u32) {
+        if !gain.is_finite() {
+            return;
+        }
+        if let Some(state) = self.gain_mut(id) {
+            state.gain = gain.clamp(0.0, MAX_GAIN);
+            let level = state.level();
+            state.ramp.glide_to(level, ramp);
+        }
+    }
+
+    /// Mutes or unmutes node `id`, ramped over `ramp` frames. Does nothing if
+    /// `id` is not a gain.
+    pub(crate) fn set_muted(&mut self, id: NodeId, muted: bool, ramp: u32) {
+        if let Some(state) = self.gain_mut(id) {
+            state.muted = muted;
+            let level = state.level();
+            state.ramp.glide_to(level, ramp);
+        }
+    }
+
+    /// Before this graph replaces `old`: every gain that `old` also has
+    /// starts where it was in `old` and glides to its own level over `ramp`
+    /// frames, so swapping graphs does not click.
+    pub(crate) fn continue_from(&mut self, old: &PreparedGraph, ramp: u32) {
+        for node in &mut self.nodes {
+            if let Process::Gain(state) = &mut node.process {
+                if let Some(previous) = old.gain(node.id) {
+                    state.ramp = Ramp::at(previous.ramp.current);
+                    let level = state.level();
+                    state.ramp.glide_to(level, ramp);
+                }
+            }
+        }
+    }
+
+    fn gain(&self, id: NodeId) -> Option<&GainState> {
+        let found = self.by_id.binary_search_by_key(&id, |&(id, _)| id).ok()?;
+        match &self.nodes[self.by_id[found].1].process {
+            Process::Gain(state) => Some(state),
+            _ => None,
+        }
+    }
+
+    fn gain_mut(&mut self, id: NodeId) -> Option<&mut GainState> {
+        let found = self.by_id.binary_search_by_key(&id, |&(id, _)| id).ok()?;
+        match &mut self.nodes[self.by_id[found].1].process {
+            Process::Gain(state) => Some(state),
+            _ => None,
         }
     }
 
@@ -120,6 +242,7 @@ impl PreparedGraph {
             input_jacks,
             sources,
             gathered,
+            ..
         } = self;
         for node in nodes.iter_mut() {
             for (slot, jack) in input_jacks[node.inputs.clone()].iter().enumerate() {
@@ -133,18 +256,19 @@ impl PreparedGraph {
                 }
             }
             let received = &gathered[..len.min(gathered.len())];
-            match node.process {
-                Process::AudioInput { channel } => {
+            match &mut node.process {
+                &mut Process::AudioInput { channel } => {
                     let out = &mut buffers[node.first_output * MAX_FRAMES..][..len];
                     read_channel(input, input_channels, offset, channel, out);
                 }
-                Process::Gain { level } => {
+                Process::Gain(state) => {
                     let out = &mut buffers[node.first_output * MAX_FRAMES..][..len];
+                    let ramp = &mut state.ramp;
                     for (out, sample) in out.iter_mut().zip(received) {
-                        *out = sample * level;
+                        *out = sample * ramp.next();
                     }
                 }
-                Process::AudioOutput { channel } if channel < output_channels => {
+                &mut Process::AudioOutput { channel } if channel < output_channels => {
                     let start = offset * output_channels + channel;
                     let samples = output
                         .get_mut(start..)
@@ -259,6 +383,7 @@ pub(crate) fn prepare(description: &GraphDescription) -> Result<PreparedGraph, G
             input_jacks.push(start..sources.len());
         }
         prepared_nodes.push(PreparedNode {
+            id: node.id,
             process: match node.kind {
                 NodeKind::AudioInput { channel } => Process::AudioInput {
                     channel: usize::from(channel),
@@ -266,21 +391,23 @@ pub(crate) fn prepare(description: &GraphDescription) -> Result<PreparedGraph, G
                 NodeKind::AudioOutput { channel } => Process::AudioOutput {
                     channel: usize::from(channel),
                 },
-                NodeKind::Gain { gain, muted } => Process::Gain {
-                    level: if muted {
-                        0.0
-                    } else {
-                        gain.clamp(0.0, MAX_GAIN)
-                    },
-                },
+                NodeKind::Gain { gain, muted } => Process::Gain(GainState::new(gain, muted)),
             },
             inputs: first_jack..input_jacks.len(),
             first_output: first_output[index],
         });
     }
 
+    let mut by_id: Vec<(NodeId, usize)> = prepared_nodes
+        .iter()
+        .enumerate()
+        .map(|(index, node)| (node.id, index))
+        .collect();
+    by_id.sort_unstable();
+
     Ok(PreparedGraph {
         nodes: prepared_nodes,
+        by_id,
         buffers: vec![0.0; outputs * MAX_FRAMES],
         input_jacks,
         sources,

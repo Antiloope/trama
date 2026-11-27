@@ -71,6 +71,21 @@ The patch is a `GraphDescription` in `trama-protocol`, plain data that any
 layer can write and that knows nothing about who wrote it. The engine
 prepares it into a graph it can run.
 
+## Graphs are swapped, never built, on the audio thread
+
+Building a graph allocates, and the audio thread must never allocate or
+free. The controller prepares each graph on its own thread and hands it
+over; the processor swaps it in and hands the old one back to be freed.
+Graphs travel in the same queue as the commands, so everything reaches the
+processor in the order it was sent.
+
+## Level changes glide over a fixed time
+
+A gain that jumps clicks. Every change of level, mute included, glides
+over 10 ms. A fixed time rather than one block keeps the sound the same
+whatever the block size, which can be under a millisecond or near a
+hundred.
+
 ## cpal's native PipeWire backend on Linux
 
 PipeWire is the sound server of most current Linux desktops, and talking

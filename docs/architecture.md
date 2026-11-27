@@ -149,6 +149,19 @@ pieces, so the buffers have a fixed size.
 A channel the sound card does not have is silent, and a sample that is
 not a number never reaches the card.
 
+**Swap, don't build.** The controller sends a prepared graph through the
+same queue as the commands, so the processor takes it in order: a command
+sent after a graph reaches that graph. The processor swaps graphs at the
+start of a block and hands the old one back through another queue, to be
+freed on the controller's thread. It only swaps when that queue has room,
+and the controller never has more graphs on their way than the queue
+holds.
+
+**Gains glide.** `SetGain` and `SetMuted` address a gain node by its id,
+and the level glides to its new value over 10 ms, whatever the block
+size, so changes do not click. A gain that is in both the old graph and
+the new one keeps the level it was at and glides to its new one.
+
 ## Time
 
 **The sound card is the clock.** At 48 kHz with blocks of 1024 samples, it
@@ -204,9 +217,11 @@ come out within a fraction of a millisecond of where they belong.
 ```
 
 The engine has two halves: the **controller**, on the core's thread, sends
-`EngineCommand`s and reads `EngineEvent`s; the **processor**, on the audio
-thread, applies the commands and computes each block. A third queue carries
-`MidiOut` from the processor to the synth output.
+`EngineCommand`s and prepared graphs and reads `EngineEvent`s; the
+**processor**, on the audio thread, applies the commands, swaps the graphs
+and computes each block. The graphs it stops running go back to the
+controller through their own queue. Another queue carries `MidiOut` from
+the processor to the synth output.
 
 ### The audio thread never waits
 
@@ -221,7 +236,8 @@ even once, the sound clicks and the clock stumbles. So the processor
 
 Everything that crosses to and from the audio thread (commands, events,
 MIDI, anchors) is small, fixed-size and copied, so the queues never need
-memory. `crates/trama-engine/tests/realtime.rs` runs the processor under
+memory. A graph crosses as a pointer to memory the controller allocated,
+and comes back the same way. `crates/trama-engine/tests/realtime.rs` runs the processor under
 `assert_no_alloc`, which aborts the test if the audio path allocates.
 
 ## Crates

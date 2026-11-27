@@ -13,7 +13,7 @@ use trama_protocol::{
 };
 
 use crate::graph::{Frames, MAX_FRAMES, PreparedGraph};
-use crate::{EngineConfig, PULSES_PER_QUARTER, ToProcessor};
+use crate::{EngineConfig, PULSES_PER_QUARTER, RAMP_SECONDS, ToProcessor};
 
 /// The half of the engine that lives on the audio thread.
 pub struct EngineProcessor {
@@ -25,6 +25,8 @@ pub struct EngineProcessor {
     events: Producer<EngineEvent>,
     midi: Producer<MidiOut>,
     graph: Box<PreparedGraph>,
+    /// How many frames a gain takes to reach a new level.
+    ramp_frames: u32,
     /// Samples computed since the engine started: Trama's master clock.
     position: u64,
     transport: Transport,
@@ -59,6 +61,7 @@ impl EngineProcessor {
             events,
             midi,
             graph: Box::new(PreparedGraph::empty()),
+            ramp_frames: (f64::from(config.sample_rate) * RAMP_SECONDS).round() as u32,
             position: 0,
             transport: Transport {
                 playing: false,
@@ -142,7 +145,8 @@ impl EngineProcessor {
             }
             match self.inbox.pop() {
                 Ok(ToProcessor::Command(command)) => self.apply(command, at),
-                Ok(ToProcessor::Graph(graph)) => {
+                Ok(ToProcessor::Graph(mut graph)) => {
+                    graph.continue_from(&self.graph, self.ramp_frames);
                     let old = std::mem::replace(&mut self.graph, graph);
                     // There is room: checked above, and only this thread
                     // pushes.
@@ -176,6 +180,12 @@ impl EngineProcessor {
                 if let Some(slot) = self.pattern.get_mut(usize::from(step)) {
                     *slot = note;
                 }
+            }
+            EngineCommand::SetGain { node, gain } => {
+                self.graph.set_gain(node, gain, self.ramp_frames);
+            }
+            EngineCommand::SetMuted { node, muted } => {
+                self.graph.set_muted(node, muted, self.ramp_frames);
             }
         }
     }
@@ -246,7 +256,60 @@ fn samples_per_pulse(sample_rate: u32, bpm: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    use rtrb::RingBuffer;
+    use trama_protocol::{GraphDescription, NodeId, NodeKind};
+
     use super::*;
+    use crate::graph::prepare;
+
+    fn gain_graph(gain: f32) -> Box<PreparedGraph> {
+        let mut graph = GraphDescription::new();
+        let input = graph.add(NodeId(0), NodeKind::AudioInput { channel: 0 });
+        let level = graph.add(NodeId(1), NodeKind::Gain { gain, muted: true });
+        let output = graph.add(NodeId(2), NodeKind::AudioOutput { channel: 0 });
+        graph.connect(input.jack(0), level.jack(0));
+        graph.connect(level.jack(0), output.jack(0));
+        Box::new(prepare(&graph).unwrap())
+    }
+
+    #[test]
+    fn a_graph_waits_until_the_old_one_can_go_back() {
+        let (mut inbox, inbox_rx) = RingBuffer::new(8);
+        let (retired_tx, mut retired) = RingBuffer::new(1);
+        let (events, _events_rx) = RingBuffer::new(8);
+        let (midi, _midi_rx) = RingBuffer::new(64);
+        let mut processor = EngineProcessor::new(
+            EngineConfig::new(48_000),
+            inbox_rx,
+            retired_tx,
+            events,
+            midi,
+        );
+        let block = |processor: &mut EngineProcessor| {
+            let mut output = [0.0_f32; 1024];
+            processor.process(&[1.0; 1024], 1, &mut output, 1, Instant::now());
+            output[1023]
+        };
+
+        let unmute = || {
+            ToProcessor::Command(EngineCommand::SetMuted {
+                node: NodeId(1),
+                muted: false,
+            })
+        };
+        assert!(inbox.push(ToProcessor::Graph(gain_graph(0.5))).is_ok());
+        assert!(inbox.push(unmute()).is_ok());
+        assert!(inbox.push(ToProcessor::Graph(gain_graph(0.25))).is_ok());
+        assert!(inbox.push(unmute()).is_ok());
+
+        // The empty graph went back and filled the queue, so the second
+        // graph and the command after it wait.
+        assert_eq!(block(&mut processor), 0.5);
+        assert_eq!(block(&mut processor), 0.5);
+        assert!(retired.pop().is_ok());
+        assert_eq!(block(&mut processor), 0.25);
+        assert!(retired.pop().is_ok());
+    }
 
     #[test]
     fn a_pulse_at_120_bpm_and_48_khz_is_1000_samples() {

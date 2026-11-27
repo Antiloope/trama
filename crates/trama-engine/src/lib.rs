@@ -38,6 +38,10 @@ use trama_protocol::{Channel, EngineCommand, EngineEvent, GraphDescription, Midi
 /// MIDI clock pulses per quarter note, fixed by the MIDI standard.
 pub const PULSES_PER_QUARTER: u32 = 24;
 
+/// How long a gain takes to reach a new level, so changes do not click,
+/// whatever the block size.
+pub const RAMP_SECONDS: f64 = 0.010;
+
 /// How the engine is set up. It cannot change while running.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EngineConfig {

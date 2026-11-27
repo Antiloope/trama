@@ -7,6 +7,7 @@
 
 use std::time::Instant;
 
+use crate::graph::NodeId;
 use crate::midi::MidiMessage;
 
 pub const STEPS: usize = 8;
@@ -35,6 +36,20 @@ pub enum EngineCommand {
     SetStep {
         step: u8,
         note: Option<StepNote>,
+    },
+    /// Set the gain node `node` of the running graph to `gain`, a linear
+    /// factor kept from 0 to [`MAX_GAIN`](crate::MAX_GAIN). The change is
+    /// ramped, so it does not click. Ignored when the graph has no such gain
+    /// or `gain` is not a number.
+    SetGain {
+        node: NodeId,
+        gain: f32,
+    },
+    /// Mute or unmute the gain node `node` of the running graph, ramped like
+    /// [`EngineCommand::SetGain`].
+    SetMuted {
+        node: NodeId,
+        muted: bool,
     },
 }
 

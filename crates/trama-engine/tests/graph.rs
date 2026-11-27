@@ -341,3 +341,212 @@ fn the_sequencer_keeps_time_while_the_graph_plays() {
     assert!(reference.len() > 40);
     assert_eq!(midi(true), reference);
 }
+
+/// Frames a gain takes to reach a new level at 48 kHz.
+const RAMP: usize = 480;
+
+/// A gain with id 1 between input 0 and output 0.
+fn one_gain(level: f32) -> GraphDescription {
+    let mut graph = GraphDescription::new();
+    let input = graph.add(NodeId(0), NodeKind::AudioInput { channel: 0 });
+    let gain = graph.add(NodeId(1), gain(level));
+    let output = graph.add(NodeId(2), NodeKind::AudioOutput { channel: 0 });
+    graph.connect(input.jack(0), gain.jack(0));
+    graph.connect(gain.jack(0), output.jack(0));
+    graph
+}
+
+fn ones(frames: usize) -> Vec<f32> {
+    vec![1.0; frames]
+}
+
+#[test]
+fn the_ramp_lasts_ten_milliseconds() {
+    assert_eq!(
+        (f64::from(SAMPLE_RATE) * trama_engine::RAMP_SECONDS) as usize,
+        RAMP
+    );
+}
+
+#[test]
+fn a_new_gain_glides_to_its_level() {
+    let mut engine = engine();
+    engine.controller.set_graph(&one_gain(1.0)).unwrap();
+    assert_eq!(run(&mut engine, &ones(256), 1, 1, 256), ones(256));
+
+    send(&mut engine, set_gain(1, 0.5));
+    let output = run(&mut engine, &ones(2 * RAMP), 1, 1, 256);
+    assert!(output[0] < 1.0 && output[0] > 0.99, "starts where it was");
+    assert!(output[..RAMP].windows(2).all(|w| w[1] < w[0]), "glides");
+    assert_eq!(output[RAMP - 1], 0.5, "arrives exactly");
+    assert!(output[RAMP..].iter().all(|s| *s == 0.5), "and stays");
+}
+
+#[test]
+fn a_ramp_does_not_depend_on_the_block_size() {
+    let glide = |block| {
+        let mut engine = engine();
+        engine.controller.set_graph(&one_gain(1.0)).unwrap();
+        run(&mut engine, &ones(100), 1, 1, 100);
+        send(&mut engine, set_gain(1, 0.1));
+        run(&mut engine, &noise(3000, 1), 1, 1, block)
+    };
+    let reference = glide(4096);
+    for block in [1, 32, 100, 480, 1024, 1500] {
+        assert_eq!(glide(block), reference, "block {block}");
+    }
+}
+
+#[test]
+fn mute_fades_out_and_unmute_comes_back_to_the_gain() {
+    let mut engine = engine();
+    engine.controller.set_graph(&one_gain(0.5)).unwrap();
+    send(
+        &mut engine,
+        EngineCommand::SetMuted {
+            node: NodeId(1),
+            muted: true,
+        },
+    );
+    let muting = run(&mut engine, &ones(2 * RAMP), 1, 1, 128);
+    assert!(muting[0] > 0.0 && muting[0] < 0.5);
+    assert!(muting[RAMP - 1..].iter().all(|s| *s == 0.0));
+
+    send(
+        &mut engine,
+        EngineCommand::SetMuted {
+            node: NodeId(1),
+            muted: false,
+        },
+    );
+    let unmuting = run(&mut engine, &ones(2 * RAMP), 1, 1, 128);
+    assert!(unmuting[0] > 0.0 && unmuting[0] < 0.01);
+    assert!(unmuting[RAMP - 1..].iter().all(|s| *s == 0.5));
+}
+
+#[test]
+fn a_new_gain_while_muted_waits_for_unmute() {
+    let mut graph = one_gain(1.0);
+    graph.nodes[1].kind = NodeKind::Gain {
+        gain: 1.0,
+        muted: true,
+    };
+    let mut engine = engine();
+    engine.controller.set_graph(&graph).unwrap();
+    send(&mut engine, set_gain(1, 0.25));
+    assert!(
+        run(&mut engine, &ones(1000), 1, 1, 128)
+            .iter()
+            .all(|s| *s == 0.0)
+    );
+    send(
+        &mut engine,
+        EngineCommand::SetMuted {
+            node: NodeId(1),
+            muted: false,
+        },
+    );
+    let output = run(&mut engine, &ones(1000), 1, 1, 128);
+    assert_eq!(output[999], 0.25);
+}
+
+#[test]
+fn commands_that_make_no_sense_are_ignored() {
+    let mut engine = engine();
+    engine.controller.set_graph(&one_gain(0.5)).unwrap();
+    for command in [
+        set_gain(1, f32::NAN),
+        set_gain(1, f32::INFINITY),
+        set_gain(1, f32::NEG_INFINITY),
+        // Not a gain.
+        set_gain(0, 0.1),
+        // Not in the graph.
+        set_gain(7, 0.1),
+        EngineCommand::SetMuted {
+            node: NodeId(2),
+            muted: true,
+        },
+    ] {
+        send(&mut engine, command);
+    }
+    let output = run(&mut engine, &ones(1000), 1, 1, 128);
+    assert!(output.iter().all(|s| *s == 0.5));
+}
+
+#[test]
+fn gains_stay_within_range_and_output_is_always_a_number() {
+    let mut engine = engine();
+    engine.controller.set_graph(&passthrough(2, 1.0)).unwrap();
+    let input = noise(200, 2);
+    let gains = [f32::NAN, 1e30, -5.0, f32::INFINITY, 0.0, 3.0, f32::MIN];
+    for (i, level) in gains.into_iter().enumerate() {
+        send(&mut engine, set_gain(1, level));
+        send(
+            &mut engine,
+            EngineCommand::SetMuted {
+                node: NodeId(11),
+                muted: i % 2 == 0,
+            },
+        );
+        let output = run(&mut engine, &input, 2, 2, 64);
+        for (out, sample) in output.iter().zip(&input) {
+            assert!(out.is_finite());
+            assert!(out.abs() <= sample.abs() * trama_protocol::MAX_GAIN);
+        }
+    }
+}
+
+#[test]
+fn swapping_graphs_keeps_each_gain_where_it_was() {
+    let mut engine = engine();
+    engine.controller.set_graph(&one_gain(1.0)).unwrap();
+    run(&mut engine, &ones(256), 1, 1, 256);
+
+    // The same gain at a new level, plus a new gain on channel 1.
+    let mut next = one_gain(0.25);
+    let input = next.add(NodeId(10), NodeKind::AudioInput { channel: 1 });
+    let fresh = next.add(NodeId(11), gain(0.5));
+    let output = next.add(NodeId(12), NodeKind::AudioOutput { channel: 1 });
+    next.connect(input.jack(0), fresh.jack(0));
+    next.connect(fresh.jack(0), output.jack(0));
+    engine.controller.set_graph(&next).unwrap();
+
+    let output = run(&mut engine, &vec![1.0; 2 * RAMP * 2], 2, 2, 256);
+    let kept = channel(&output, 2, 0);
+    let new = channel(&output, 2, 1);
+    assert!(kept[0] > 0.99, "no jump from the old level");
+    assert_eq!(kept[RAMP - 1], 0.25);
+    assert!(
+        new.iter().all(|s| *s == 0.5),
+        "a new gain starts at its level"
+    );
+}
+
+#[test]
+fn commands_sent_after_a_graph_reach_that_graph() {
+    let mut engine = engine();
+    engine.controller.set_graph(&one_gain(1.0)).unwrap();
+    run(&mut engine, &ones(256), 1, 1, 256);
+
+    let mut next = one_gain(1.0);
+    next.nodes[1].id = NodeId(5);
+    next.cables = Vec::new();
+    next.connect(NodeId(0).jack(0), NodeId(5).jack(0));
+    next.connect(NodeId(5).jack(0), NodeId(2).jack(0));
+    engine.controller.set_graph(&next).unwrap();
+    send(&mut engine, set_gain(5, 0.0));
+
+    let output = run(&mut engine, &ones(2 * RAMP), 1, 1, 256);
+    assert_eq!(output[RAMP - 1], 0.0);
+}
+
+fn send(engine: &mut Engine, command: EngineCommand) {
+    engine.controller.send(command).expect("command queue full");
+}
+
+fn set_gain(node: u32, gain: f32) -> EngineCommand {
+    EngineCommand::SetGain {
+        node: NodeId(node),
+        gain,
+    }
+}

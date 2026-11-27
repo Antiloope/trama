@@ -13,7 +13,8 @@ use trama_protocol::{EngineCommand, GraphDescription, NodeId, NodeKind, StepNote
 #[global_allocator]
 static ALLOCATOR: AllocDisabler = AllocDisabler;
 
-/// Every input channel through a gain to every output channel.
+/// Every input channel through a gain to every output channel. The gains
+/// have the same ids in every patch, so swaps carry their levels over.
 fn patch(channels: u16) -> GraphDescription {
     let mut graph = GraphDescription::new();
     let outputs: Vec<NodeId> = (0..channels)
@@ -62,6 +63,37 @@ fn processing_never_allocates() {
     send(EngineCommand::SetTempo { bpm: 174.0 });
     send(EngineCommand::Play);
     engine.controller.set_graph(&patch(2)).unwrap();
+    // Graphs and gain changes queued together, so swaps happen inside the
+    // test, between commands, while gains are still gliding.
+    for round in 0..7 {
+        engine.controller.set_graph(&patch(2 + round % 2)).unwrap();
+        for command in [
+            EngineCommand::SetGain {
+                node: NodeId(50),
+                gain: 0.1 * f32::from(round),
+            },
+            EngineCommand::SetMuted {
+                node: NodeId(51),
+                muted: round % 2 == 0,
+            },
+        ] {
+            engine.controller.send(command).unwrap();
+        }
+    }
+    engine
+        .controller
+        .send(EngineCommand::SetGain {
+            node: NodeId(50),
+            gain: 0.5,
+        })
+        .unwrap();
+    engine
+        .controller
+        .send(EngineCommand::SetMuted {
+            node: NodeId(51),
+            muted: false,
+        })
+        .unwrap();
 
     let processor = &mut engine.processor;
     assert_no_alloc(|| {
@@ -77,4 +109,7 @@ fn processing_never_allocates() {
     });
     assert!(processor.dropped_messages() > 0);
     assert!(output.iter().all(|s| *s == 0.25));
+    // The controller frees the graphs the processor handed back.
+    while engine.controller.next_event().is_some() {}
+    engine.controller.set_graph(&patch(2)).unwrap();
 }
