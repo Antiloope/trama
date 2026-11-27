@@ -8,8 +8,13 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-# Allowed, added when first used: trama-protocol, trama-dsp.
+rtrb = "0.4.1"
+trama-protocol.workspace = true
+# Also allowed, added when first used: trama-dsp.
 # See docs/architecture.md, section 6.
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+assert_no_alloc = "1.1.2"

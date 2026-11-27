@@ -55,3 +55,31 @@ from the start.
 
 **Why:** it is the common language of Rust and open source, so anyone can
 read and contribute.
+
+## 10. Mappings also decide the lights
+
+**Why:** if the core's mappings say how each control should be lit (as
+`Notification`s addressed to one device), adapters stay simple translators
+and the meaning of the grid lives in one place. The Launchpad adapter knows
+how to light pad (4, 5) green, not why.
+
+## 11. MIDI timing through anchors
+
+**Why:** the engine places MIDI on exact samples, but MIDI ports only send
+"now". The engine leaves an anchor (sample, instant) every block, and the
+MIDI output maps samples to instants using the smallest recent offset,
+because audio callbacks are only ever late. Messages go out 10 ms after
+their sample's time so the MIDI thread is never the one making them late.
+Live controls such as pitch bend skip the queue and go out at once.
+
+## 12. The first mapping is code; setup files come later
+
+**Why:** milestone 1 needs one layout (the step sequencer), and writing it in
+code first shows what a mapping must be able to say before designing the
+file format (milestone 5).
+
+## 13. cpal's native PipeWire backend on Linux
+
+**Why:** PipeWire is what Fedora runs, and talking to it directly avoids the
+extra ALSA layer. cpal falls back to ALSA when PipeWire is not running. It
+needs `pipewire-devel` and `clang-devel` to build.
