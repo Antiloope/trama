@@ -7,8 +7,10 @@
 //!
 //! - the 8 × 8 pads are notes: 11 is the bottom-left pad, 18 the bottom-right,
 //!   88 the top-right (row × 10 + column, both counted from 1);
-//! - the top row of buttons sends control changes 91 to 98;
-//! - the right column sends control changes 89 (top) down to 19 (bottom);
+//! - the top row of buttons sends control changes 91 to 98; the first four
+//!   are the arrows;
+//! - the right column, the row buttons, sends control changes 89 (top) down
+//!   to 19 (bottom);
 //! - sending the same note or control change back lights the pad or button:
 //!   the value is a color from the Launchpad's palette, and the MIDI channel
 //!   picks solid (1), flashing (2) or pulsing (3).
@@ -37,10 +39,6 @@ pub const LIVE_MODE: [u8; 9] = [0xF0, 0x00, 0x20, 0x29, 0x02, 0x0C, 0x0E, 0x00, 
 
 const TOP_BUTTONS: [&str; 8] = [
     "up", "down", "left", "right", "session", "note", "custom", "capture",
-];
-
-const SIDE_BUTTONS: [&str; 8] = [
-    "scene_1", "scene_2", "scene_3", "scene_4", "scene_5", "scene_6", "scene_7", "scene_8",
 ];
 
 pub fn parse(bytes: &[u8]) -> Option<(Control, Action)> {
@@ -77,6 +75,7 @@ pub fn light_message(control: Control, light: Light) -> Option<[u8; 3]> {
         Control::Pad { row, column } if row < 8 && column < 8 => {
             Some([0x90 | channel, (row + 1) * 10 + column + 1, color])
         }
+        Control::RowButton { row } if row < 8 => Some([0xB0 | channel, (row + 1) * 10 + 9, color]),
         Control::Button(name) => Some([0xB0 | channel, button_number(name)?, color]),
         _ => None,
     }
@@ -93,19 +92,16 @@ fn pad(note: u8) -> Option<Control> {
 fn button(number: u8) -> Option<Control> {
     match number {
         91..=98 => Some(Control::Button(TOP_BUTTONS[usize::from(number - 91)])),
-        19..=89 if number % 10 == 9 => {
-            Some(Control::Button(SIDE_BUTTONS[usize::from(8 - number / 10)]))
-        }
+        19..=89 if number % 10 == 9 => Some(Control::RowButton {
+            row: number / 10 - 1,
+        }),
         _ => None,
     }
 }
 
 fn button_number(name: &str) -> Option<u8> {
-    if let Some(i) = TOP_BUTTONS.iter().position(|b| *b == name) {
-        return Some(91 + i as u8);
-    }
-    let i = SIDE_BUTTONS.iter().position(|b| *b == name)?;
-    Some(89 - 10 * i as u8)
+    let i = TOP_BUTTONS.iter().position(|b| *b == name)?;
+    Some(91 + i as u8)
 }
 
 /// The palette entry closest to each color.
@@ -245,7 +241,7 @@ mod tests {
     }
 
     #[test]
-    fn buttons_have_names() {
+    fn top_buttons_have_names_and_the_right_column_is_row_buttons() {
         assert_eq!(
             parse(&[0xB0, 91, 127]),
             Some((Control::Button("up"), Action::Press { velocity: 1.0 }))
@@ -256,18 +252,18 @@ mod tests {
         );
         assert_eq!(
             parse(&[0xB0, 89, 127]).map(|(c, _)| c),
-            Some(Control::Button("scene_1"))
+            Some(Control::RowButton { row: 7 })
         );
         assert_eq!(
             parse(&[0xB0, 19, 127]).map(|(c, _)| c),
-            Some(Control::Button("scene_8"))
+            Some(Control::RowButton { row: 0 })
         );
         assert_eq!(parse(&[0xB0, 99, 127]), None, "the logo is not a button");
         assert_eq!(parse(&[0xB0, 25, 127]), None);
     }
 
     #[test]
-    fn every_button_name_lights_the_button_it_came_from() {
+    fn every_button_lights_the_button_it_came_from() {
         for number in (91..=98).chain((19..=89).step_by(10)) {
             let (control, _) = parse(&[0xB0, number, 127]).unwrap();
             let message = light_message(control, Light::solid(Color::Green)).unwrap();

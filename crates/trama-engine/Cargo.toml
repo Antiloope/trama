@@ -1,6 +1,6 @@
 [package]
 name = "trama-engine"
-description = "Trama's real-time audio engine: audio graph, clock, loopers, mixer"
+description = "Trama's real-time engine: master clock, transport, MIDI clock and step sequencer"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

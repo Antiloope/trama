@@ -47,6 +47,12 @@ whether a comment is needed: that part is on you.
 - Dependencies must be GPL-3.0 compatible and `cargo deny check` must pass.
   Do not widen `deny.toml` without checking the license.
 - No `unsafe`: the workspace lints forbid it.
+- Trama works with whatever gear its user has. Only an adapter in
+  `trama-io` may know a particular model of device. The protocol, the core
+  and the engine talk about kinds of controls, never models; defaults never
+  assume a device; docs name a model only where Trama has its adapter, and
+  examples use made-up names. The hardware the maintainers test with
+  belongs in `testing` issues, not in the repository.
 - Crate dependencies point one way: `trama` uses `trama-io`, `trama-core`
   and `trama-engine`, which use `trama-protocol`. `trama-core` knows no
   devices or audio, `trama-engine` knows no devices or sound card, and

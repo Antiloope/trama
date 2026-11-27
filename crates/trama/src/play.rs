@@ -26,13 +26,16 @@ use trama_protocol::{Channel, DeviceId, Input, Notification};
 
 #[derive(Args)]
 pub struct PlayArgs {
-    /// MIDI port of the Launchpad X (part of its name), or "none".
-    #[arg(long, default_value = launchpad_x::DEFAULT_PORT)]
-    pads: String,
+    /// MIDI port of a Launchpad X (part of its name), or "none". Without it,
+    /// Trama looks for a Launchpad X and carries on without one if none is
+    /// connected.
+    #[arg(long)]
+    pads: Option<String>,
 
-    /// MIDI port of the synth (part of its name), "virtual" to create a port
-    /// other programs can connect to, or "none".
-    #[arg(long, default_value = "MiniBrute")]
+    /// MIDI port of the synth (part of its name, as `trama doctor` lists it),
+    /// "virtual" to create a port named "trama synth" that a synth or another
+    /// program connects to, or "none".
+    #[arg(long, default_value = "virtual")]
     synth: String,
 
     /// MIDI channel the synth listens on, 1 to 16.
@@ -95,7 +98,6 @@ enum CoreMessage {
 
 pub fn run(args: PlayArgs) -> anyhow::Result<()> {
     let channel = Channel::from_number(args.channel).context("MIDI channel")?;
-    let pads = (args.pads != "none").then(|| DeviceId::new("pads"));
     let gamepad = (!args.no_gamepad).then(|| DeviceId::new("joy"));
     let synth_port = match args.synth.as_str() {
         "none" => None,
@@ -151,22 +153,33 @@ pub fn run(args: PlayArgs) -> anyhow::Result<()> {
         _ => None,
     };
 
-    let launchpad = match &pads {
-        Some(device) => {
+    let pads_device = DeviceId::new("pads");
+    let launchpad = match args.pads.as_deref() {
+        Some("none") => None,
+        chosen => {
             let tx = core_tx.clone();
-            let launchpad = LaunchpadX::connect(
-                device.clone(),
-                &args.pads,
+            let connected = LaunchpadX::connect(
+                pads_device.clone(),
+                chosen.unwrap_or(launchpad_x::DEFAULT_PORT),
                 move |input| {
                     let _ = tx.send(CoreMessage::Input(input));
                 },
                 subscribe(),
-            )?;
-            println!("  pads:     {}", launchpad.port());
-            Some(launchpad)
+            );
+            match (connected, chosen) {
+                (Ok(launchpad), _) => {
+                    println!("  pads:     {}", launchpad.port());
+                    Some(launchpad)
+                }
+                (Err(error), None) => {
+                    eprintln!("  pads:     {error}; carrying on without them");
+                    None
+                }
+                (Err(error), Some(_)) => return Err(error.into()),
+            }
         }
-        None => None,
     };
+    let pads = launchpad.as_ref().map(|_| pads_device);
 
     let gamepads = match &gamepad {
         Some(device) => {

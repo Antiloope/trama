@@ -8,10 +8,10 @@ threads and crates. The reasons behind the main choices are in
 ## The big picture
 
 Trama connects instruments and controllers and plays them together, in time
-with the sound card. It runs an 8-step sequencer: a Launchpad X edits the
-pattern and shows the playhead, a gamepad adds pitch bend and modulation,
-and a MIDI synth (a MiniBrute 2S, an OP-1, anything with a MIDI input)
-plays the notes and follows Trama's MIDI clock.
+with the sound card. It runs an 8-step sequencer: a grid controller edits
+the pattern and shows the playhead, a gamepad adds pitch bend and
+modulation, and a synth with a MIDI input plays the notes and follows
+Trama's MIDI clock.
 
 Trama does three jobs, and each job is a layer:
 
@@ -22,7 +22,7 @@ Trama does three jobs, and each job is a layer:
 | **Engine** | Keep time and place every event on an exact sample      | play        |
 
 ```
- Launchpad X · gamepads · MIDI synths (MiniBrute 2S, OP-1, ...)
+ grid controllers · gamepads · MIDI synths
         │  MIDI bytes, gamepad events            ▲  LED colors, MIDI
         ▼                                        │
  ┌────────────────────────────────────────────────────────────┐
@@ -78,6 +78,12 @@ others are addressed to one device ("light pad (3, 4) on `pads` blue",
 "send this pitch bend to `synth` now"). Adapters stay plain translators: the
 Launchpad adapter knows how to light a pad, not what a lit pad means.
 
+Adapters name controls by kind, never by model: a pad on a grid
+(`Control::Pad`), the button beside a grid's row (`Control::RowButton`), a
+grid's arrows (`up`, `down`, `left`, `right`), a gamepad's buttons and
+sticks by their place on the Xbox layout (`south`, `left_stick_y`). A
+mapping written for a kind of device works with every model of that kind.
+
 `MidiOut` goes from the engine straight to the synth's output, without the
 core, because notes and clock must land on the beat (see "Time").
 
@@ -104,8 +110,9 @@ core, because notes and clock must land on the beat (see "Time").
 
 - **Each layer is tested alone.** The core is fed messages and its answers
   are checked; the engine runs without a sound card; adapters are fed bytes.
-- **A new device is an adapter and a mapping**, with no changes to the core
-  or the engine.
+- **A new model is only an adapter.** It names its controls by kind, so the
+  mappings for that kind already work with it. A new kind of device is an
+  adapter and a mapping; the session and the engine stay as they are.
 - **No locks between layers.** Threads share messages, not data.
 
 ## State: who owns what
