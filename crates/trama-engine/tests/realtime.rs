@@ -80,7 +80,7 @@ fn patch(round: u32) -> EnginePatch {
         player("lead", "clock", 5, 3, &devices[1..2]),
         player("drums", "half", 16, 6, &devices[2..]),
     ];
-    if round % 3 == 0 {
+    if round.is_multiple_of(3) {
         step_players.remove(1);
     }
     EnginePatch {

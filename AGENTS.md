@@ -59,4 +59,6 @@ whether a comment is needed: that part is on you.
   `trama-io` knows neither the core nor the engine.
 - `EngineProcessor` runs on the audio thread: it must never allocate, lock,
   block, print or touch files. `crates/trama-engine/tests/realtime.rs`
-  checks allocations.
+  checks allocations. The same holds for the sound card callbacks in
+  `trama-io`; `crates/trama-io/src/audio/clocks_apart.rs` checks the
+  input's resampler and the cushion.

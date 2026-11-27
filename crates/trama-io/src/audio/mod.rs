@@ -5,15 +5,20 @@
 //! arrived; audio never passes through the core.
 //!
 //! cpal opens input and output as two streams. The input reaches the output
-//! callback through a cushion, a ring buffer a few blocks deep, so both must
-//! run on one clock: on PipeWire any input and output do, because PipeWire runs them
-//! together; elsewhere the input must be the output device itself, which on
-//! macOS can be an aggregate device.
+//! callback through a cushion, a ring buffer a few blocks deep. On PipeWire
+//! any input and output run on one clock, because PipeWire runs them
+//! together; elsewhere only the input of the output device itself does. An
+//! input on a clock of its own keeps its device's sample rate and is
+//! resampled to the output's, by a ratio the cushion's fill steers.
 //!
 //! On Linux cpal talks to PipeWire directly when it is running, and falls
 //! back to ALSA. On macOS it uses CoreAudio.
 
+#[cfg(test)]
+mod clocks_apart;
 mod cushion;
+mod drift;
+mod resample;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -21,7 +26,8 @@ use std::time::{Duration, Instant};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{BufferSize, Device, Host, Stream, StreamConfig};
 pub use cushion::InputStats;
-use cushion::{Counters, CushionReader};
+use cushion::{Counters, CushionReader, CushionWriter};
+use resample::InputResampler;
 
 use crate::error::{Error, Result};
 
@@ -203,13 +209,13 @@ impl OutputDevice {
                     let mut done = 0;
                     while done < frames {
                         let len = (frames - done).min(RENDER_FRAMES);
+                        // A piece's moment is when it would have started,
+                        // so MIDI anchors and the cushion's fill stay true.
+                        let at = now + Duration::from_secs_f64(done as f64 / sample_rate);
                         let piece = &mut received[..len * input_channels];
                         if let Some(reader) = reader.as_mut() {
-                            reader.read(piece);
+                            reader.read(piece, at);
                         }
-                        // A piece's moment is when it would have started,
-                        // so MIDI anchors stay true.
-                        let at = now + Duration::from_secs_f64(done as f64 / sample_rate);
                         render(
                             piece,
                             input_channels,
@@ -236,18 +242,20 @@ impl OutputDevice {
 }
 
 /// An input device that has been chosen but not started. It opens with
-/// every channel the device offers, at the output's sample rate and block
-/// size.
+/// every channel the device offers and the output's block size. On the
+/// output's clock it opens at the output's sample rate; on a clock of its
+/// own, at the rate its device runs at, and it is resampled.
 pub struct InputDevice {
     device: Device,
     config: StreamConfig,
     name: String,
+    /// The output's sample rate, when the input is resampled to it.
+    resampled_to: Option<u32>,
 }
 
 impl InputDevice {
     /// The default input, or the first one whose name contains `pattern`
-    /// (ignoring case), to play through `output`. Fails if the two do not
-    /// share a clock.
+    /// (ignoring case), to play through `output`.
     pub fn find(pattern: Option<&str>, output: &OutputDevice) -> Result<InputDevice> {
         let host = cpal::default_host();
         let device = match pattern {
@@ -261,26 +269,27 @@ impl InputDevice {
             })?,
         };
         let name = device.to_string();
-        if !one_clock_for_all(&host) && !same_device(&device, &output.device) {
-            return Err(Error::new(format!(
-                "\"{name}\" and \"{}\" are different devices, each with a clock of its own, \
-                 and Trama needs input and output on one clock. Choose an input of \"{}\"; \
-                 on macOS, Audio MIDI Setup can join both into an aggregate device",
-                output.name, output.name
-            )));
-        }
+        let shares_clock = one_clock_for_all(&host) || same_device(&device, &output.device);
         let supported = device
             .default_input_config()
             .map_err(|e| Error::context(&format!("reading the settings of \"{name}\""), e))?;
+        // A device on a clock of its own keeps the rate it runs at: asking
+        // for another would change it for every program using it.
+        let sample_rate = if shares_clock {
+            output.config.sample_rate
+        } else {
+            supported.sample_rate()
+        };
         let config = StreamConfig {
             channels: supported.channels(),
-            sample_rate: output.config.sample_rate,
+            sample_rate,
             buffer_size: output.config.buffer_size,
         };
         Ok(InputDevice {
             device,
             config,
             name,
+            resampled_to: (!shares_clock).then_some(output.config.sample_rate),
         })
     }
 
@@ -292,14 +301,41 @@ impl InputDevice {
         self.config.channels
     }
 
+    pub fn sample_rate(&self) -> u32 {
+        self.config.sample_rate
+    }
+
+    /// Whether the input runs on a clock of its own, and is resampled to
+    /// the output's.
+    pub fn is_resampled(&self) -> bool {
+        self.resampled_to.is_some()
+    }
+
     fn start(self) -> Result<(Stream, CushionReader, Arc<Counters>)> {
-        let (mut writer, reader, counters) =
-            cushion::cushion(usize::from(self.config.channels), CUSHION_FRAMES);
+        let channels = usize::from(self.config.channels);
+        let (mut writer, reader, counters) = match self.resampled_to {
+            None => {
+                let (writer, reader, counters) = cushion::cushion(channels, CUSHION_FRAMES);
+                (InputWriter::Direct(writer), reader, counters)
+            }
+            Some(output_rate) => {
+                let (writer, reader, counters) =
+                    cushion::steered_cushion(channels, CUSHION_FRAMES, output_rate);
+                let resampler = InputResampler::new(writer, self.config.sample_rate, output_rate)?;
+                (
+                    InputWriter::Resampled(Box::new(resampler)),
+                    reader,
+                    counters,
+                )
+            }
+        };
         let stream = self
             .device
             .build_input_stream(
                 self.config,
-                move |data: &[f32], _: &cpal::InputCallbackInfo| writer.write(data),
+                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    writer.write(data, Instant::now());
+                },
                 |error| eprintln!("audio input: {error}"),
                 None,
             )
@@ -308,6 +344,21 @@ impl InputDevice {
             .play()
             .map_err(|e| Error::context(&format!("starting \"{}\"", self.name), e))?;
         Ok((stream, reader, counters))
+    }
+}
+
+/// What the input callback writes into the cushion through.
+enum InputWriter {
+    Direct(CushionWriter),
+    Resampled(Box<InputResampler>),
+}
+
+impl InputWriter {
+    fn write(&mut self, samples: &[f32], at: Instant) {
+        match self {
+            InputWriter::Direct(writer) => writer.write(samples, at),
+            InputWriter::Resampled(resampler) => resampler.write(samples, at),
+        }
     }
 }
 

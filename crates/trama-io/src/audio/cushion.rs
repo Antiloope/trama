@@ -16,18 +16,30 @@
 //!   the newest input that does not fit is dropped, the oldest that piled
 //!   up is skipped.
 //!
+//! When the input runs on a clock of its own, a resampler feeds the writer
+//! and the reader steers it ([`steered_cushion`]). Input blocks then arrive
+//! at moments that slide slowly past the reads, so the reader measures the
+//! fill as if input arrived sample by sample: what the ring holds plus what
+//! the input has captured since its last block. It keeps that fill an input
+//! block and a quarter above the cushion, enough for the moment just before
+//! a block arrives.
+//!
 //! Both callbacks run on audio threads: nothing here allocates, locks or
 //! blocks.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::time::Instant;
 
 use rtrb::{Consumer, Producer, RingBuffer};
 
+use super::drift::DriftControl;
+
 pub(crate) const MAX_CUSHION_BLOCKS: u32 = 4;
 
-/// What the cushion has been through, readable from any thread.
-#[derive(Debug, Default)]
+/// What the two ends of the cushion share, and what it has been through,
+/// readable from any thread.
+#[derive(Debug)]
 pub(crate) struct Counters {
     underruns: AtomicU64,
     overruns: AtomicU64,
@@ -36,6 +48,13 @@ pub(crate) struct Counters {
     input_block: AtomicUsize,
     /// Whether the input has delivered any sample other than zero.
     heard_sound: AtomicBool,
+    /// The bits of an `f64`: when the input's last block arrived, in output
+    /// frames since the cushion was made, minus the frames written by then.
+    /// NaN until the first block.
+    input_lag: AtomicU64,
+    /// The bits of an `f64`: the correction the reader asks of the
+    /// resampler, a factor near 1.
+    correction: AtomicU64,
 }
 
 /// How the input has fared so far.
@@ -55,6 +74,18 @@ pub struct InputStats {
 }
 
 impl Counters {
+    fn new() -> Counters {
+        Counters {
+            underruns: AtomicU64::new(0),
+            overruns: AtomicU64::new(0),
+            cushion_blocks: AtomicU32::new(1),
+            input_block: AtomicUsize::new(0),
+            heard_sound: AtomicBool::new(false),
+            input_lag: AtomicU64::new(f64::NAN.to_bits()),
+            correction: AtomicU64::new(1.0_f64.to_bits()),
+        }
+    }
+
     pub(crate) fn stats(&self) -> InputStats {
         InputStats {
             underruns: self.underruns.load(Ordering::Relaxed),
@@ -66,21 +97,42 @@ impl Counters {
 }
 
 /// A cushion for `channels` interleaved channels that holds up to
-/// `capacity` frames.
+/// `capacity` frames, between an input and an output on one clock.
 pub(crate) fn cushion(
     channels: usize,
     capacity: usize,
 ) -> (CushionWriter, CushionReader, Arc<Counters>) {
+    build(channels, capacity, None)
+}
+
+/// A cushion whose reader steers the resampler that feeds its writer, for
+/// an input on a clock of its own. `sample_rate` is the output's.
+pub(crate) fn steered_cushion(
+    channels: usize,
+    capacity: usize,
+    sample_rate: u32,
+) -> (CushionWriter, CushionReader, Arc<Counters>) {
+    build(channels, capacity, Some(sample_rate))
+}
+
+fn build(
+    channels: usize,
+    capacity: usize,
+    steered_at: Option<u32>,
+) -> (CushionWriter, CushionReader, Arc<Counters>) {
     let channels = channels.max(1);
     let (producer, consumer) = RingBuffer::new(capacity * channels);
-    let counters = Arc::new(Counters::default());
-    counters.cushion_blocks.store(1, Ordering::Relaxed);
+    let counters = Arc::new(Counters::new());
+    let start = Instant::now();
     (
         CushionWriter {
             ring: producer,
             channels,
             heard_sound: false,
             counters: counters.clone(),
+            clock: steered_at.map(|rate| StreamClock::new(start, rate)),
+            written: 0,
+            block_frames: 0,
         },
         CushionReader {
             ring: consumer,
@@ -88,9 +140,34 @@ pub(crate) fn cushion(
             filling: true,
             cushion_blocks: 1,
             counters: counters.clone(),
+            steering: steered_at.map(|rate| Steering {
+                clock: StreamClock::new(start, rate),
+                read: 0,
+                drift: DriftControl::new(rate),
+            }),
         },
         counters,
     )
+}
+
+/// Counts time in output frames since the cushion was made.
+#[derive(Clone, Copy, Debug)]
+struct StreamClock {
+    start: Instant,
+    sample_rate: f64,
+}
+
+impl StreamClock {
+    fn new(start: Instant, sample_rate: u32) -> StreamClock {
+        StreamClock {
+            start,
+            sample_rate: f64::from(sample_rate),
+        }
+    }
+
+    fn frames_at(&self, at: Instant) -> f64 {
+        at.saturating_duration_since(self.start).as_secs_f64() * self.sample_rate
+    }
 }
 
 /// The input stream's end of the cushion.
@@ -99,14 +176,34 @@ pub(crate) struct CushionWriter {
     channels: usize,
     heard_sound: bool,
     counters: Arc<Counters>,
+    /// Present when the reader steers a resampler.
+    clock: Option<StreamClock>,
+    written: u64,
+    block_frames: usize,
 }
 
 impl CushionWriter {
-    /// Queues interleaved `samples`. Whole frames only: what does not fit
-    /// is dropped and counted.
-    pub(crate) fn write(&mut self, samples: &[f32]) {
+    pub(crate) fn channels(&self) -> usize {
+        self.channels
+    }
+
+    /// The correction the reader asks of the resampler, a factor near 1.
+    pub(crate) fn correction(&self) -> f64 {
+        f64::from_bits(self.counters.correction.load(Ordering::Relaxed))
+    }
+
+    /// Queues the interleaved `samples` of one input block, captured by
+    /// `at`. Whole frames only: what does not fit is dropped and counted.
+    pub(crate) fn write(&mut self, samples: &[f32], at: Instant) {
+        self.push(samples);
+        self.end_block(at);
+    }
+
+    /// Queues part of one input block; [`end_block`](Self::end_block)
+    /// closes it.
+    pub(crate) fn push(&mut self, samples: &[f32]) {
         let frames = samples.len() / self.channels;
-        self.counters.input_block.store(frames, Ordering::Relaxed);
+        self.block_frames += frames;
         if !self.heard_sound && samples.iter().any(|s| *s != 0.0) {
             self.heard_sound = true;
             self.counters.heard_sound.store(true, Ordering::Relaxed);
@@ -114,9 +211,24 @@ impl CushionWriter {
         let fits = (self.ring.slots() / self.channels).min(frames) * self.channels;
         if let Ok(chunk) = self.ring.write_chunk_uninit(fits) {
             chunk.fill_from_iter(samples[..fits].iter().copied());
+            self.written += (fits / self.channels) as u64;
         }
         if fits < frames * self.channels {
             self.counters.overruns.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Closes an input block captured by `at`.
+    pub(crate) fn end_block(&mut self, at: Instant) {
+        self.counters
+            .input_block
+            .store(self.block_frames, Ordering::Relaxed);
+        self.block_frames = 0;
+        if let Some(clock) = &self.clock {
+            let lag = clock.frames_at(at) - self.written as f64;
+            self.counters
+                .input_lag
+                .store(lag.to_bits(), Ordering::Relaxed);
         }
     }
 }
@@ -129,6 +241,25 @@ pub(crate) struct CushionReader {
     filling: bool,
     cushion_blocks: u32,
     counters: Arc<Counters>,
+    /// Present when the input runs on a clock of its own.
+    steering: Option<Steering>,
+}
+
+struct Steering {
+    clock: StreamClock,
+    /// Frames taken out of the ring, read or skipped.
+    read: u64,
+    drift: DriftControl,
+}
+
+impl Steering {
+    /// The frames the ring would hold at `at` had input arrived sample by
+    /// sample: what was written, plus what the input has captured since its
+    /// last block, minus what was taken out. NaN before the first block.
+    fn fill(&self, counters: &Counters, at: Instant) -> f64 {
+        let lag = f64::from_bits(counters.input_lag.load(Ordering::Relaxed));
+        self.clock.frames_at(at) - lag - self.read as f64
+    }
 }
 
 impl CushionReader {
@@ -136,30 +267,29 @@ impl CushionReader {
         self.channels
     }
 
+    #[cfg(test)]
+    pub(crate) fn queued_frames(&self) -> usize {
+        self.ring.slots() / self.channels
+    }
+
     /// Fills `out`, interleaved, with the oldest input, or with silence
-    /// while the cushion fills.
-    pub(crate) fn read(&mut self, out: &mut [f32]) {
+    /// while the cushion fills. `at` is when the output starts playing
+    /// `out`.
+    pub(crate) fn read(&mut self, out: &mut [f32], at: Instant) {
         let wanted = out.len() / self.channels * self.channels;
         let input_block = self.counters.input_block.load(Ordering::Relaxed) * self.channels;
         let block = input_block.max(wanted);
         let cushion = self.cushion_blocks as usize * block;
 
-        let mut available = self.ring.slots();
-        if self.filling {
-            if available < cushion.max(1) {
-                out.fill(0.0);
-                return;
-            }
-            self.filling = false;
-        }
-        if available > wanted + cushion + block {
-            let skip = (available - wanted - cushion) / self.channels * self.channels;
-            self.skip(skip);
-            available -= skip;
-            self.counters.overruns.fetch_add(1, Ordering::Relaxed);
-        }
-
-        let got = self.pop_into(&mut out[..wanted.min(available)]);
+        let got = if self.steering.is_some() {
+            self.read_steered(&mut out[..wanted], input_block, block, cushion, at)
+        } else {
+            self.read_on_one_clock(&mut out[..wanted], block, cushion)
+        };
+        let Some(got) = got else {
+            out.fill(0.0);
+            return;
+        };
         out[got..].fill(0.0);
         if got < wanted {
             self.counters.underruns.fetch_add(1, Ordering::Relaxed);
@@ -169,6 +299,73 @@ impl CushionReader {
                 .store(self.cushion_blocks, Ordering::Relaxed);
             self.filling = true;
         }
+    }
+
+    /// Reads into `out`, counted in samples like `block` and `cushion`, and
+    /// returns how many it got, or `None` while the cushion fills.
+    fn read_on_one_clock(
+        &mut self,
+        out: &mut [f32],
+        block: usize,
+        cushion: usize,
+    ) -> Option<usize> {
+        let wanted = out.len();
+        let mut available = self.ring.slots();
+        if self.filling {
+            if available < cushion.max(1) {
+                return None;
+            }
+            self.filling = false;
+        }
+        if available > wanted + cushion + block {
+            let skip = (available - wanted - cushion) / self.channels * self.channels;
+            self.skip(skip);
+            available -= skip;
+            self.counters.overruns.fetch_add(1, Ordering::Relaxed);
+        }
+        Some(self.pop_into(&mut out[..wanted.min(available)]))
+    }
+
+    /// Reads into `out` like [`read_on_one_clock`](Self::read_on_one_clock),
+    /// keeping the fill on its target, and steers the resampler.
+    fn read_steered(
+        &mut self,
+        out: &mut [f32],
+        input_block: usize,
+        block: usize,
+        cushion: usize,
+        at: Instant,
+    ) -> Option<usize> {
+        let channels = self.channels;
+        let target = ((cushion + input_block + input_block / 4) / channels) as f64;
+        let mut fill = self.steering.as_ref()?.fill(&self.counters, at);
+        let mut skipped = 0;
+        if self.filling {
+            if fill.is_nan() || fill < target {
+                return None;
+            }
+            self.filling = false;
+            // Start right on the target, so the loop has no step to chase.
+            skipped = self.skip_frames((fill - target) as usize);
+        } else if fill > target + (block / channels) as f64 {
+            skipped = self.skip_frames((fill - target) as usize);
+            self.counters.overruns.fetch_add(1, Ordering::Relaxed);
+        }
+        fill -= skipped as f64;
+
+        let len = out.len().min(self.ring.slots());
+        let got = self.pop_into(&mut out[..len]);
+        let steering = self.steering.as_mut()?;
+        steering.read += (skipped + got / channels) as u64;
+        if fill.is_finite() {
+            let correction = steering
+                .drift
+                .correction(fill - target, out.len() / channels);
+            self.counters
+                .correction
+                .store(correction.to_bits(), Ordering::Relaxed);
+        }
+        Some(got)
     }
 
     fn pop_into(&mut self, out: &mut [f32]) -> usize {
@@ -189,6 +386,14 @@ impl CushionReader {
             chunk.commit_all();
         }
     }
+
+    /// Skips up to `frames` frames, as many as the ring holds, and returns
+    /// how many it skipped.
+    fn skip_frames(&mut self, frames: usize) -> usize {
+        let frames = frames.min(self.ring.slots() / self.channels);
+        self.skip(frames * self.channels);
+        frames
+    }
 }
 
 #[cfg(test)]
@@ -201,15 +406,19 @@ mod tests {
 
     fn read(reader: &mut CushionReader, frames: usize) -> Vec<f32> {
         let mut out = vec![f32::NAN; frames * reader.channels];
-        reader.read(&mut out);
+        reader.read(&mut out, Instant::now());
         out
+    }
+
+    fn write(writer: &mut CushionWriter, samples: &[f32]) {
+        writer.write(samples, Instant::now());
     }
 
     #[test]
     fn plays_silence_until_a_block_has_arrived() {
         let (mut writer, mut reader, counters) = cushion(1, 1024);
         assert_eq!(read(&mut reader, 64), vec![0.0; 64]);
-        writer.write(&frames(1, 64));
+        write(&mut writer, &frames(1, 64));
         assert_eq!(read(&mut reader, 64), frames(1, 64));
         assert_eq!(counters.stats().underruns, 0);
     }
@@ -218,14 +427,14 @@ mod tests {
     fn keeps_whole_frames_in_order() {
         let (mut writer, mut reader, _) = cushion(2, 1024);
         let input = frames(1, 2 * 100);
-        writer.write(&input);
+        write(&mut writer, &input);
         assert_eq!(read(&mut reader, 100), input);
     }
 
     #[test]
     fn an_underrun_plays_silence_and_grows_the_cushion() {
         let (mut writer, mut reader, counters) = cushion(1, 1024);
-        writer.write(&frames(1, 64));
+        write(&mut writer, &frames(1, 64));
         assert_eq!(read(&mut reader, 64), frames(1, 64));
 
         // The output comes first this time: nothing is waiting.
@@ -234,11 +443,11 @@ mod tests {
         assert_eq!((stats.underruns, stats.cushion_blocks), (1, 2));
 
         // Now it waits for two blocks before playing again.
-        writer.write(&frames(65, 64));
+        write(&mut writer, &frames(65, 64));
         assert_eq!(read(&mut reader, 64), vec![0.0; 64]);
-        writer.write(&frames(129, 64));
+        write(&mut writer, &frames(129, 64));
         assert_eq!(read(&mut reader, 64), frames(65, 64));
-        writer.write(&frames(193, 64));
+        write(&mut writer, &frames(193, 64));
         assert_eq!(read(&mut reader, 64), frames(129, 64));
         assert_eq!(counters.stats().underruns, 1);
     }
@@ -246,9 +455,9 @@ mod tests {
     #[test]
     fn a_short_input_plays_what_there_is_then_silence() {
         let (mut writer, mut reader, counters) = cushion(1, 1024);
-        writer.write(&frames(1, 64));
+        write(&mut writer, &frames(1, 64));
         assert_eq!(read(&mut reader, 64), frames(1, 64));
-        writer.write(&frames(65, 10));
+        write(&mut writer, &frames(65, 10));
         let out = read(&mut reader, 64);
         assert_eq!(&out[..10], &frames(65, 10)[..]);
         assert!(out[10..].iter().all(|s| *s == 0.0));
@@ -269,8 +478,8 @@ mod tests {
     #[test]
     fn input_that_does_not_fit_is_dropped_and_counted() {
         let (mut writer, mut reader, counters) = cushion(2, 100);
-        writer.write(&frames(1, 2 * 80));
-        writer.write(&frames(1000, 2 * 80));
+        write(&mut writer, &frames(1, 2 * 80));
+        write(&mut writer, &frames(1000, 2 * 80));
         assert_eq!(counters.stats().overruns, 1);
         let out = read(&mut reader, 100);
         assert_eq!(&out[..160], &frames(1, 160)[..]);
@@ -281,7 +490,7 @@ mod tests {
     fn input_that_piles_up_is_skipped_down_to_the_cushion() {
         let (mut writer, mut reader, counters) = cushion(1, 4096);
         for block in 0..10 {
-            writer.write(&frames(1 + block * 64, 64));
+            write(&mut writer, &frames(1 + block * 64, 64));
         }
         // Ten blocks waiting: keep the newest one, plus one for the cushion.
         let out = read(&mut reader, 64);
@@ -293,9 +502,50 @@ mod tests {
     #[test]
     fn notices_the_first_sound() {
         let (mut writer, _reader, counters) = cushion(1, 1024);
-        writer.write(&[0.0; 64]);
+        write(&mut writer, &[0.0; 64]);
         assert!(!counters.stats().heard_sound);
-        writer.write(&[0.0, 0.1, 0.0]);
+        write(&mut writer, &[0.0, 0.1, 0.0]);
         assert!(counters.stats().heard_sound);
+    }
+
+    #[test]
+    fn a_steered_reader_counts_input_captured_since_its_last_block() {
+        let rate = 48_000;
+        let (mut writer, reader, _) = steered_cushion(1, 4096, rate);
+        let start = Instant::now();
+        let at = |frames: u32| {
+            start + std::time::Duration::from_secs_f64(f64::from(frames) / f64::from(rate))
+        };
+
+        // A block of 64 at frame 64, then reads at 64 and 96: half a block
+        // later, 32 more frames are on their way.
+        writer.write(&frames(1, 64), at(64));
+        let steering = reader.steering.as_ref().unwrap();
+        let fill = |time| steering.fill(&reader.counters, time);
+        assert!((fill(at(64)) - 64.0).abs() < 0.5);
+        assert!((fill(at(96)) - 96.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn a_steered_reader_waits_for_its_target_then_starts_on_it() {
+        let rate = 48_000;
+        let (mut writer, mut reader, counters) = steered_cushion(1, 4096, rate);
+        let start = Instant::now();
+        let at = |frames: u32| {
+            start + std::time::Duration::from_secs_f64(f64::from(frames) / f64::from(rate))
+        };
+        let mut out = [f32::NAN; 64];
+
+        // The target is a cushion of one block plus an input block and a
+        // quarter: 64 + 80 frames.
+        writer.write(&frames(1, 64), at(64));
+        reader.read(&mut out, at(64));
+        assert_eq!(out, [0.0; 64]);
+        writer.write(&frames(65, 64), at(128));
+        writer.write(&frames(129, 64), at(192));
+        reader.read(&mut out, at(192));
+        // 192 frames waiting, 144 kept: the first 48 are skipped.
+        assert_eq!(out.to_vec(), frames(49, 64));
+        assert_eq!(counters.stats().underruns, 0);
     }
 }

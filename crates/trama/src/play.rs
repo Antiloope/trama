@@ -70,9 +70,9 @@ pub struct PlayArgs {
     audio: Option<String>,
 
     /// Audio input (part of its name, as `trama doctor` lists it), or
-    /// "default" for the system's default. It must share a clock with the
-    /// output: on PipeWire any input does, elsewhere it must be the output
-    /// device itself. Without it, Trama opens no input.
+    /// "default" for the system's default. An input on another clock than
+    /// the output, such as another device without PipeWire, is resampled to
+    /// it. Without it, Trama opens no input.
     #[arg(long, value_name = "NAME")]
     audio_in: Option<String>,
 
@@ -224,8 +224,16 @@ pub fn run(args: PlayArgs) -> anyhow::Result<()> {
         output.channels()
     );
     if let Some(input) = &input {
+        let clock = if input.is_resampled() {
+            format!(
+                ", {} Hz on a clock of its own, resampled",
+                input.sample_rate()
+            )
+        } else {
+            String::new()
+        };
         println!(
-            "  audio in: {} ({} channels)",
+            "  audio in: {} ({} channels{clock})",
             input.name(),
             input.channels()
         );

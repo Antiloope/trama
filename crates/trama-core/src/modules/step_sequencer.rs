@@ -101,7 +101,7 @@ impl StepSequencer {
         if settings.root > 127 {
             return Err("the root is not a MIDI note");
         }
-        if settings.rate == 0 || PULSES_PER_WHOLE_NOTE % settings.rate != 0 {
+        if settings.rate == 0 || !PULSES_PER_WHOLE_NOTE.is_multiple_of(settings.rate) {
             return Err("the rate must divide 96, such as 4, 8, 12, 16 or 32");
         }
         let (rows, steps) = (settings.rows, settings.steps);

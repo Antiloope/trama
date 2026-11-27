@@ -150,24 +150,32 @@ over 10 ms. A fixed time rather than one block keeps the sound the same
 whatever the block size, which can be under a millisecond or near a
 hundred.
 
-## Input and output share one clock
+## An input on another clock is resampled
 
 Two sound cards each have a clock of their own, and over minutes they
 drift apart: the input arrives a little faster or slower than the output
-plays. Trama does not correct that. It plays an input only through an
-output on the same clock, and the cushion between the two streams only
-absorbs which callback runs first:
+plays, and the cushion between the two streams fills up or runs dry. Most
+people's gear is like that: a laptop's built-in microphone and its
+headphones are two devices. So Trama plays any input through any output,
+and resamples an input on another clock than the output's:
 
-- on PipeWire, any input and output, because PipeWire runs every stream
-  of one program in the same cycle and adapts the devices to it;
-- elsewhere, the input of the output device itself. On macOS, an
-  aggregate device made in Audio MIDI Setup joins several devices on one
-  clock.
+- Pairs on one clock skip the resampler, and with it its delay and its
+  CPU: on PipeWire every input and output, because PipeWire runs every
+  stream of one program in the same cycle and adapts the devices to it;
+  elsewhere, the input of the output device itself.
+- The resampler is rubato's sinc resampler. It lets the ratio change
+  while it runs, keeps aliasing inaudible and never allocates once made,
+  and its license, MIT, is GPL-3.0 compatible. One of our own would sound
+  worse for the same work.
+- The cushion's fill measures the drift, and a slow loop steers the ratio
+  from it: it follows the drift and lets the jitter of callbacks pass, so
+  the pitch never moves by an audible amount.
+- The input keeps the sample rate its device runs at. Asking for the
+  output's would change the device for every program using it, and the
+  resampler handles any rate.
 
-Trama refuses an input on another clock instead of letting it click every
-few minutes. Correcting the drift means resampling, which touches only the
-sound card adapter in `trama-io`: the engine receives blocks of input
-either way.
+Resampling touches only the sound card adapter in `trama-io`: the engine
+receives blocks of input at the output's rate either way.
 
 ## The cushion starts at one block and grows
 
@@ -175,7 +183,9 @@ Waiting for more input before playing it means fewer gaps and more delay.
 The cushion starts at one block, the least that works when the output
 callback runs before the input one, and grows by a block at each underrun,
 up to four, so a system that needs more gets it and one that does not
-keeps the shortest delay. Monitoring also feels the block size itself:
+keeps the shortest delay. A resampled input is kept an input block and a
+quarter above the cushion, because its blocks arrive at moments that
+slide past the reads. Monitoring also feels the block size itself:
 `--block-size` asks for smaller blocks.
 
 ## Inputs stay closed and monitoring starts muted
