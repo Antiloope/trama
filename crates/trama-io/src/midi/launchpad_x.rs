@@ -43,7 +43,6 @@ const SIDE_BUTTONS: [&str; 8] = [
     "scene_1", "scene_2", "scene_3", "scene_4", "scene_5", "scene_6", "scene_7", "scene_8",
 ];
 
-/// What a message from the Launchpad means, if anything.
 pub fn parse(bytes: &[u8]) -> Option<(Control, Action)> {
     match MidiMessage::parse(bytes)? {
         MidiMessage::NoteOn { note, velocity, .. } => Some((
@@ -67,7 +66,6 @@ pub fn parse(bytes: &[u8]) -> Option<(Control, Action)> {
     }
 }
 
-/// The message that lights `control` as `light`.
 pub fn light_message(control: Control, light: Light) -> Option<[u8; 3]> {
     let channel = match light.mode {
         LightMode::Solid => 0,
@@ -127,7 +125,6 @@ fn palette(color: Color) -> u8 {
     }
 }
 
-/// A connected Launchpad X.
 pub struct LaunchpadX {
     _input: MidiInputConnection<()>,
     lights: JoinHandle<()>,
@@ -233,7 +230,7 @@ mod tests {
             parse(&[0x90, 88, 0]),
             Some((Control::Pad { row: 7, column: 7 }, Action::Release))
         );
-        // The pad from the architecture walk-through: 0x2D is note 45.
+        // 0x2D is note 45: row 4, column 5, counting from 1.
         assert!(matches!(
             parse(&[0x90, 0x2D, 0x64]),
             Some((Control::Pad { row: 3, column: 4 }, Action::Press { .. }))

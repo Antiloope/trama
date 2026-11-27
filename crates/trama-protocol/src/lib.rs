@@ -2,22 +2,19 @@
 
 //! The shared vocabulary of Trama.
 //!
-//! Layers never call into each other; they exchange the messages defined
-//! here:
+//! Layers never call into each other; they exchange these messages:
 //!
-//! | Message          | Meaning                          | From                           | To                     |
-//! |------------------|----------------------------------|--------------------------------|------------------------|
-//! | [`Input`]        | something happened on a device   | io                             | core                   |
-//! | [`Command`]      | what the musician wants          | core mappings, web UI, network | core                   |
-//! | [`EngineCommand`]| exactly what the engine must do  | core                           | engine                 |
-//! | [`EngineEvent`]  | what the engine reports back     | engine                         | core                   |
-//! | [`Notification`] | what changed                     | core                           | io (LEDs, MIDI, UI)    |
-//! | [`MidiOut`]      | MIDI that must land on the beat  | engine                         | io (MIDI output)       |
+//! | Message           | Meaning                          | From              | To               |
+//! |-------------------|----------------------------------|-------------------|------------------|
+//! | [`Input`]         | something happened on a device   | io                | core             |
+//! | [`Command`]       | what the musician wants          | the core's mapping| core             |
+//! | [`EngineCommand`] | exactly what the engine must do  | core              | engine           |
+//! | [`EngineEvent`]   | what the engine reports back     | engine            | core             |
+//! | [`Notification`]  | what changed                     | core              | io (lights, MIDI)|
+//! | [`MidiOut`]       | MIDI that must land on the beat  | engine            | io (MIDI output) |
 //!
 //! This crate depends on nothing else in Trama, so every other crate can
 //! depend on it.
-//!
-//! See `docs/architecture.md`, section 2.
 
 mod command;
 mod engine;

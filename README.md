@@ -1,15 +1,13 @@
 # Trama
 
-Trama is a free-software instrument hub for making music with hardware and
-code. It connects synths, MIDI controllers, gamepads, tablets and phones to a
-sound engine written in Rust, so you can jam, loop, sample and record without
-a DAW.
+Trama connects synths, MIDI controllers and gamepads and plays them together,
+in time with the sound card, without a DAW. It is free software written in
+Rust, and runs on Linux and macOS.
 
-It runs on Linux and macOS.
-
-**Status:** milestone 1. Trama makes no sound of its own yet: it runs a step
-sequencer on a Launchpad X that plays a MIDI synth (such as an Arturia
-MiniBrute 2S) in time with the sound card, with a gamepad for pitch bend.
+It runs an 8-step sequencer: a Launchpad X edits the pattern and shows the
+playhead, a gamepad adds pitch bend and modulation, and a MIDI synth (an
+Arturia MiniBrute 2S, a Teenage Engineering OP-1, anything with a MIDI input)
+plays the notes and follows Trama's MIDI clock.
 
 ## Build
 
@@ -74,7 +72,10 @@ the MIDI clock was.
 ## Documentation
 
 - [Architecture](docs/architecture.md): how Trama is put together.
-- [Decisions](docs/decisions.md): what we chose and why.
+- [Decisions](docs/decisions.md): why it is built this way.
+- [Contributing](CONTRIBUTING.md): building, testing and the project's
+  conventions.
+- Plans and ideas live in [GitHub issues](https://github.com/Antiloope/trama/issues).
 
 ## License
 

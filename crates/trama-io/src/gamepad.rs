@@ -16,7 +16,6 @@ use trama_protocol::{Action, Control, DeviceId, Input};
 
 use crate::error::{Error, Result};
 
-/// The names of connected gamepads.
 pub fn list_gamepads() -> Result<Vec<String>> {
     let gilrs = open()?;
     Ok(gilrs
@@ -56,7 +55,6 @@ impl PadEvent {
     }
 }
 
-/// What a gamepad event means, if anything.
 fn translate(event: PadEvent) -> Option<(Control, Action)> {
     match event {
         PadEvent::Pressed(button) => Some((

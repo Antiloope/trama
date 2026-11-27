@@ -1,5 +1,5 @@
 # The Trama workspace: one repository, several packages ("crates") that are
-# built, tested and versioned together. See docs/architecture.md, section 6.
+# built, tested and versioned together.
 
 [workspace]
 resolver = "3"
@@ -14,7 +14,6 @@ license = "GPL-3.0-or-later"
 publish = false
 
 # Internal crates, so each one can say `trama-protocol.workspace = true`.
-# (trama-dsp joins this list when the engine first uses it.)
 [workspace.dependencies]
 trama-protocol = { path = "crates/trama-protocol" }
 trama-engine = { path = "crates/trama-engine" }
@@ -22,8 +21,7 @@ trama-core = { path = "crates/trama-core" }
 trama-io = { path = "crates/trama-io" }
 
 [workspace.lints.rust]
-# No crate may use `unsafe`. A future plugin-hosting crate will be the single,
-# documented exception (talking to C/C++ plugins requires it).
+# No crate may use `unsafe`.
 unsafe_code = "forbid"
 
 [workspace.lints.clippy]

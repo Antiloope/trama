@@ -1,176 +1,150 @@
 # Trama architecture
 
-This document explains how Trama is put together, from the big picture down
-to the packages, the build and the tests. It is meant to be read top to
-bottom. Anything marked *(planned)* does not exist in the code yet, and the
-sketches of types and files will change as we build them.
+How Trama is put together: its layers, the messages between them, time,
+threads and crates. The reasons behind the main choices are in
+[decisions.md](decisions.md); how to build and test is in
+[CONTRIBUTING.md](../CONTRIBUTING.md).
 
-Decisions and the reasons behind them are logged in
-[decisions.md](decisions.md).
+## The big picture
 
-## 1. The big picture
-
-Trama is a program that runs on a computer (Linux or macOS) and turns a pile
-of instruments and controllers into one instrument.
-
-You plug in your gear. Trama listens to all of it, decides what each gesture
-means according to the current **setup**, makes sound, records, and lights up
-the controllers to show what is going on. A web page, opened on the computer,
-a tablet or a phone, is used to configure things. Once a setup is ready you
-can play without looking at a screen.
+Trama connects instruments and controllers and plays them together, in time
+with the sound card. It runs an 8-step sequencer: a Launchpad X edits the
+pattern and shows the playhead, a gamepad adds pitch bend and modulation,
+and a MIDI synth (a MiniBrute 2S, an OP-1, anything with a MIDI input)
+plays the notes and follows Trama's MIDI clock.
 
 Trama does three jobs, and each job is a layer:
 
-| Layer      | Job                                                           | In one word |
-|------------|---------------------------------------------------------------|-------------|
-| **IO**     | Talk to the outside world: devices, sound card, network, disk | translate   |
-| **Core**   | Know the state of the session and decide what happens         | decide      |
-| **Engine** | Make the sound, on time, every few milliseconds               | play        |
-
-A **setup** is not code: it is a file that tells the core which gear exists
-and what each control does.
+| Layer      | Job                                                     | In one word |
+|------------|---------------------------------------------------------|-------------|
+| **IO**     | Talk to the outside world: devices and the sound card   | translate   |
+| **Core**   | Know the state of the session and decide what happens   | decide      |
+| **Engine** | Keep time and place every event on an exact sample      | play        |
 
 ```
-   ┌──────────────────────────────────────────────────────────────┐
-   │  OUTSIDE WORLD                                               │
-   │  Launchpad X · XPS-10 · OP-1 · MiniBrute 2S · gamepad        │
-   │  iPad / phone (web page) · other computer · files on disk    │
-   └───────────────┬──────────────────────────────▲───────────────┘
-                   │ bytes, presses, packets      │ LEDs, MIDI, web updates
-   ┌───────────────▼──────────────────────────────┴───────────────┐
-   │  IO       adapters, one per kind of device                   │
-   └───────────────┬──────────────────────────────▲───────────────┘
-                   │ Input                        │ Notification
-   ┌───────────────▼──────────────────────────────┴───────────────┐
-   │  CORE     session state + mappings       ◄──── setup file    │
-   └───────────────┬──────────────────────────────▲───────────────┘
-                   │ EngineCommand                │ EngineEvent
-   ┌───────────────▼──────────────────────────────┴───────────────┐
-   │  ENGINE   audio graph, clock, loopers, synths, mixer         │
-   └───────────────┬──────────────────────────────▲───────────────┘
-                   │ audio out                    │ audio in
-   ┌───────────────▼──────────────────────────────┴───────────────┐
-   │  OPERATING SYSTEM   PipeWire / JACK (Linux), CoreAudio (macOS)│
-   │                     → Scarlett 2i2 → speakers, headphones    │
-   └──────────────────────────────────────────────────────────────┘
+ Launchpad X · gamepads · MIDI synths (MiniBrute 2S, OP-1, ...)
+        │  MIDI bytes, gamepad events            ▲  LED colors, MIDI
+        ▼                                        │
+ ┌────────────────────────────────────────────────────────────┐
+ │ IO       adapters, one per kind of device                  │
+ └────────────────────────────────────────────────────────────┘
+        │ Input              ▲ Notification       ▲ MidiOut
+        ▼                    │                    │ (notes and clock
+ ┌──────────────────────────────────────┐         │  on exact samples)
+ │ CORE     session state, mapping      │         │
+ └──────────────────────────────────────┘         │
+        │ EngineCommand      ▲ EngineEvent        │
+        ▼                    │                    │
+ ┌────────────────────────────────────────────────────────────┐
+ │ ENGINE   transport, MIDI clock, step sequencer             │
+ └────────────────────────────────────────────────────────────┘
+        │ silence, one block at a time
+        ▼
+ PipeWire or ALSA (Linux), CoreAudio (macOS) → sound card
 ```
 
-The piece of IO that opens the sound card is tiny: it only hands each block
-of audio to the engine and back. Audio never passes through the core.
+The engine writes silence: the sound card is there as Trama's clock. The
+piece of IO that opens it only hands each block to the engine; audio never
+passes through the core.
 
 Three rules hold everything together:
 
-1. **Everything is a message.** Layers never reach into each other; they send
-   messages (section 2).
+1. **Everything is a message.** Layers never reach into each other; they
+   send the messages described below.
 2. **Each piece of state has one owner.** The core owns the session, the
-   engine owns what is sounding right now. Everyone else asks (section 3).
-3. **The audio thread never waits.** Anything slow happens elsewhere and is
-   handed over ready to use (section 5).
+   engine owns what is sounding right now. Everyone else asks.
+3. **The audio thread never waits.** Nothing on it allocates, locks or
+   blocks.
 
-## 2. Messages
+## Messages
 
-There are five kinds of messages. Their types live in `trama-protocol`.
+The message types live in `trama-protocol`.
 
-| Message         | Meaning                           | Example                                         |
-|-----------------|-----------------------------------|-------------------------------------------------|
-| `Input`         | what happened on a device         | pad (4, 5) on `pads` pressed, velocity 0.79     |
-| `Command`       | what the musician wants           | launch clip (track 5, scene 4)                  |
-| `EngineCommand` | exactly what the engine must do   | start node 12 on the next bar                   |
-| `EngineEvent`   | what the engine reports back      | node 12 started at sample 1 536 000             |
-| `Notification`  | what changed in the session       | clip (5, 4) is now playing                      |
+| Message         | Meaning                                  | Example                                     |
+|-----------------|------------------------------------------|---------------------------------------------|
+| `Input`         | what happened on a device                | pad (3, 4) on `pads` pressed, velocity 0.79 |
+| `Command`       | what the musician wants                  | toggle scale degree 3 on step 4             |
+| `EngineCommand` | exactly what the engine must do          | step 4 plays F2, velocity 100               |
+| `EngineEvent`   | what the engine reports back             | step 4 started at sample 1 512 000          |
+| `Notification`  | what changed                             | light pad (3, 4) on `pads` blue             |
+| `MidiOut`       | MIDI that must land on an exact sample   | note on F2 at sample 1 512 000              |
 
-`Input` is about devices ("this button"). `Command` is about music ("this
-clip"). The **mappings** in the setup file are the bridge between the two,
-which is why changing a setup never needs new code.
+`Input` is about devices ("this pad"). `Command` is about music ("this
+step"). The **mapping** is the bridge between the two, and it works in both
+directions: it turns `Input`s into `Command`s, and it decides how each
+control should be lit to show the session. That is why some
+`Notification`s are about the session (transport, steps, playhead) and
+others are addressed to one device ("light pad (3, 4) on `pads` blue",
+"send this pitch bend to `synth` now"). Adapters stay plain translators: the
+Launchpad adapter knows how to light a pad, not what a lit pad means.
 
-Mappings work in both directions. Going in, they turn `Input`s into
-`Command`s. Going out, they decide how each control should be lit to show
-the session, so some `Notification`s are addressed to one device: "light
-pad (4, 5) on `pads` green", or "send this pitch bend to `synth` now". That
-keeps adapters as plain translators: the Launchpad adapter knows how to
-light a pad, not what a lit pad means.
-
-A sixth message, `MidiOut`, goes from the engine straight to the MIDI
-output: notes and clock that must land on an exact sample (section 4).
-
-`Command`s can also arrive directly, without an `Input`: the web page and
-other computers send them.
+`MidiOut` goes from the engine straight to the synth's output, without the
+core, because notes and clock must land on the beat (see "Time").
 
 ### Walk-through: pressing a pad on the Launchpad
 
 1. The Launchpad sends three bytes over USB: `90 2D 64` (note on, note 45,
    velocity 100).
-2. The Launchpad adapter (IO) knows its layout and produces an `Input`:
-   pad at row 4, column 5, pressed with velocity 0.79.
-3. The core looks at the setup's mappings. In this setup the grid means
-   "column = track, row = scene", so the `Input` becomes the `Command`
-   *launch clip (track 5, scene 4)*.
-4. The core updates the session: clip (5, 4) is now *queued*. It sends a
-   `Notification`; the Launchpad adapter makes that pad blink and the web page
-   updates.
-5. The core sends the engine an `EngineCommand`: *start node 12 on the next
-   bar*.
-6. Inside the audio thread, the engine starts the clip exactly on the first
-   sample of the next bar and reports an `EngineEvent`.
-7. The core marks the clip as *playing* and sends a `Notification`; the pad
-   turns solid green.
-
-From press to blinking light takes a millisecond or two. The sound itself
-waits for the bar line on purpose.
-
-The looper arrives in milestone 3, but milestone 1's step sequencer already
-takes this path: a pad press becomes `ToggleStep`, the core updates the
-pattern, the engine gets `SetStep`, and the Launchpad gets the pad's new
-light.
+2. The Launchpad adapter knows its layout: note 45 is the pad in row 3,
+   column 4, counting from 0 at the bottom-left. It produces an `Input`:
+   pad (3, 4) pressed with velocity 0.79.
+3. The core's mapping says each column is a step and each row a scale
+   degree, so the `Input` becomes the `Command` *toggle degree 3 on step 4*.
+4. The core updates the pattern. In C2 minor, degree 3 is F2 (MIDI 41). It
+   sends the engine *step 4 plays F2*, announces the new step, and asks for
+   pad (3, 4) to be lit blue. The Launchpad adapter turns that into
+   `90 2D 2D` (note 45, palette color 45).
+5. When the transport reaches step 4, the engine, on the audio thread,
+   writes a note on for F2 on that step's exact sample and reports that the
+   step started.
+6. The core moves the playhead: column 4 turns dim and pad (3, 4) green. The
+   synth output sends the note on when its sample's moment comes.
 
 ### Why messages
 
-- **Setups are just data**: a mapping is "this `Input` → that `Command`".
-- **Presets and scenes are snapshots** of the state the messages built.
-- **Recording a performance** means saving the `Command`s with their times;
-  replaying them reproduces the jam, even with different sounds.
-- **The network is free**: messages can be serialized and sent to another
-  computer, or come from a phone.
-- **Tests are easy**: send messages in, check what comes out.
+- **Each layer is tested alone.** The core is fed messages and its answers
+  are checked; the engine runs without a sound card; adapters are fed bytes.
+- **A new device is an adapter and a mapping**, with no changes to the core
+  or the engine.
+- **No locks between layers.** Threads share messages, not data.
 
-## 3. State: who owns what
+## State: who owns what
 
-| Owner        | What it owns                                                                       |
-|--------------|------------------------------------------------------------------------------------|
-| Core         | The session: tracks, clips, scenes, instruments, parameter values, tempo, mappings |
-| Engine       | What is sounding now: playhead positions, filter memory, buffers being recorded    |
-| IO adapters  | Only what they need to talk to their device, such as which LEDs are lit            |
-| Disk         | Setups, sessions, samples, recordings                                              |
+| Owner         | What it owns                                                                             |
+|---------------|------------------------------------------------------------------------------------------|
+| Core          | The session: pattern, tempo, transport, octave, root and scale, the last pitch bend and modulation sent, what each pad shows |
+| Engine        | Its copy of the pattern, the note it is holding, the transport's position, the master clock |
+| IO adapters   | Their connections; the synth output also keeps the MIDI waiting to be sent              |
 
-The core is the single source of truth. If the web page wants to change a
-parameter, it sends a `Command` to the core like any other device.
+The core is the single source of truth for the session. Anything that wants
+to change it sends a `Command`.
 
-## 4. Time
+## Time
 
-**The sound card is the clock.** At 48 kHz with blocks of 128 samples, it asks
-for audio every 2.7 ms. The engine counts samples, and that count is Trama's
-master clock. Bars and beats are computed from the count and the tempo.
+**The sound card is the clock.** At 48 kHz with blocks of 1024 samples, it
+asks for audio every 21 ms. The engine counts samples, and that count is
+Trama's master clock. The transport turns the count and the tempo into MIDI
+clock pulses (24 per quarter note) and sequencer steps.
 
-- **Everything that must land on the beat is decided inside the engine**,
-  in samples: clip launches, loop boundaries, step sequencers, the MIDI clock
-  sent to hardware.
-- **The core thinks ahead.** It says "on the next bar", not "now".
-- **MIDI to hardware** (MiniBrute 2S, OP-1, XPS-10): the engine writes
-  time-stamped MIDI events into a queue and a MIDI-out thread in IO sends
-  them. This is the one path that goes from the engine straight to IO without
-  passing through the core, because timing matters more than anything else
-  there.
-- **Ableton Link** *(planned)*: the engine nudges its tempo and beat phase to
-  match other computers and apps on the network.
+- **Everything on the beat is decided inside the engine**, in samples: the
+  MIDI clock, step starts, note ons and note offs.
+- **Engine commands take effect at the start of the next block.**
+- **MIDI to hardware**: the engine writes time-stamped MIDI into its own
+  queue, and the synth output in IO sends it. This is the one path from the
+  engine to IO that skips the core, because timing matters more than
+  anything else there.
+- **Live controls** (pitch bend, the modulation wheel) do not wait for the
+  beat: the core addresses them to the synth, and the synth output sends
+  them the moment they arrive.
 
 ### From samples to MIDI
 
-A MIDI port only knows "send now", so the MIDI output has to turn "sample
+A MIDI port only knows "send now", so the synth output turns "sample
 96 000" into a moment on the computer's clock:
 
 1. every block, the engine leaves an **anchor** in the MIDI queue: "the
    block starting at sample S was computed at instant T";
-2. the MIDI output keeps the last 64 anchors and, for each, the offset
+2. the synth output keeps the last 64 anchors and, for each, the offset
    between T and S. Audio callbacks can wake up late but never early, and a
    stream starts with a burst of blocks to fill the sound card's buffer, so
    it uses the **smallest** recent offset: the callback that was most on
@@ -178,20 +152,10 @@ A MIDI port only knows "send now", so the MIDI output has to turn "sample
 3. each message is sent at its sample's time plus a fixed 10 ms, so it is
    never late because the MIDI thread itself woke up a little late.
 
-Live controls (pitch bend, the modulation wheel) skip all of this: they are
-sent the moment they arrive. Measured against a virtual synth on Linux with
-PipeWire, the clock pulses come out within a fraction of a millisecond of
-where they belong.
+Measured against a virtual synth on Linux with PipeWire, MIDI clock pulses
+come out within a fraction of a millisecond of where they belong.
 
-Two kinds of loops, both supported by the engine from the start:
-
-- **synced loops** have a length in bars and follow the tempo (beats, rave);
-- **free loops** have a length in samples and ignore the tempo, so loops of
-  different lengths drift against each other (ambient, textures).
-
-## 5. Threads
-
-Trama runs several threads (things happening at the same time):
+## Threads
 
 ```
   ┌──────────────────────────────────────────┐
@@ -199,265 +163,114 @@ Trama runs several threads (things happening at the same time):
   └──────────▲──────────────────┬────────────┘
              │  lock-free queues: fixed size, never block
   ┌──────────┴──────────────────▼────────────┐
-  │ core thread (the program's main thread)  │  session, mappings
+  │ core thread (the program's main thread)  │  session, mapping
   └──────────▲──────────────────┬────────────┘
              │  channels
   ┌──────────┴──────────────────▼────────────┐
-  │ IO threads                               │  MIDI in/out, gamepad,
-  │                                          │  network, disk
+  │ IO threads                               │  Launchpad input and
+  │                                          │  lights, gamepads,
+  │                                          │  synth MIDI output
   └──────────────────────────────────────────┘
 ```
+
+The engine has two halves: the **controller**, on the core's thread, sends
+`EngineCommand`s and reads `EngineEvent`s; the **processor**, on the audio
+thread, applies the commands and computes each block. A third queue carries
+`MidiOut` from the processor to the synth output.
 
 ### The audio thread never waits
 
 The audio thread is like a drummer who can never miss a beat. If it is late
-even once, you hear a click. So inside it Trama **never**:
+even once, the sound clicks and the clock stumbles. So the processor
+**never**:
 
 - allocates or frees memory;
 - takes a lock (waits for another thread);
 - touches files or the network;
 - prints, logs, or calls anything that might do one of the above.
 
-Heavy work is done **outside and handed over ready to use**. Loading a sample
-means: the disk thread decodes the file, the engine controller wraps it in a
-sampler node, and the audio thread receives the finished node through a
-queue and plugs it in. Whatever the audio thread stops using is sent back out
-to be freed elsewhere.
+Everything that crosses to and from the audio thread (commands, events,
+MIDI, anchors) is small, fixed-size and copied, so the queues never need
+memory. `crates/trama-engine/tests/realtime.rs` runs the processor under
+`assert_no_alloc`, which aborts the test if the audio path allocates.
 
-That is why the engine has two halves: the **controller** (normal thread, may
-allocate) and the **processor** (audio thread, may not).
-
-Tests enforce the rule: the processor runs under `assert_no_alloc`, which
-makes a test fail if the audio path allocates (section 10).
-
-## 6. Packages
+## Crates
 
 Trama is a Cargo **workspace**: one repository with several packages
-(*crates*) that are built and tested together.
+(*crates*) built and tested together.
 
 ```
 trama/
 ├── Cargo.toml            the workspace: list of crates and shared settings
 ├── crates/
 │   ├── trama-protocol/   the messages every layer speaks
-│   ├── trama-dsp/        pure audio building blocks (math on buffers)
 │   ├── trama-engine/     the real-time engine (no devices, no sound card)
-│   ├── trama-core/       the brain: session state, setups, mappings, scenes
-│   ├── trama-io/         adapters: sound card, MIDI, gamepad, OSC, web, disk
+│   ├── trama-core/       the brain: session state, mapping, scales
+│   ├── trama-io/         adapters: sound card, Launchpad X, synths, gamepads
 │   └── trama/            the program: wires everything together
 ├── docs/                 this document and the decision log
-├── setups/               example setup files (planned)
-└── web/                  the web interface (planned)
+└── scripts/              repository checks
 ```
 
 Who may depend on whom:
 
 ```
-                    trama  (the program)
-           ┌──────────┼──────────────┐
-           ▼          ▼              ▼
-       trama-io   trama-core    trama-engine
-           │          │           │       │
-           │          │           │       ▼
-           │          │           │   trama-dsp
-           ▼          ▼           ▼
-                 trama-protocol
+                trama  (the program)
+         ┌────────┼────────────┐
+         ▼        ▼            ▼
+     trama-io  trama-core  trama-engine
+         │        │            │
+         ▼        ▼            ▼
+              trama-protocol
 ```
 
 - **Arrows only point down.** Nothing depends on the program, and
-  `trama-protocol` and `trama-dsp` depend on no other Trama crate.
-- **`trama-core` knows nothing about devices or audio.** It is pure logic.
+  `trama-protocol` depends on no other Trama crate.
+- **`trama-core` knows nothing about devices or audio.** It is plain logic:
+  every method takes a message and returns the messages to send.
 - **`trama-engine` knows nothing about devices or the sound card.** It is
-  "audio in, audio out", so tests can run it offline and render to a file.
-- **`trama-io` knows nothing about the core or the engine.** It translates.
+  "audio in, audio out", so tests run it offline.
+- **`trama-io` knows nothing about the core or the engine.** It translates;
+  the sound card adapter takes a render function, not the engine.
 - **Only `trama` knows everyone**, and its job is to connect them.
-- **No crate may use `unsafe`** (enforced by the compiler through the
-  workspace lints). The future `trama-plugins` crate will be the one
-  exception, because talking to C/C++ plugins requires it, and it keeps that
-  code in one place.
+- **No crate uses `unsafe`**, enforced by the workspace lints.
 
-Splitting into crates makes the compiler enforce these boundaries: the engine
-cannot call the MIDI library by accident because it does not depend on it.
-It also makes rebuilds faster, since only the crates that changed recompile.
+Splitting into crates makes the compiler enforce these boundaries: the
+engine cannot call the MIDI library by accident because it does not depend
+on it.
 
-An internal dependency is added to a crate's `Cargo.toml` the first time code
-uses it (Cargo warns about unused dependencies), always following the
-diagram above. `trama-dsp` has no users yet; it joins when the engine makes
-its first sound (milestone 2).
+The main outside libraries:
 
-The main outside libraries, and the crate that uses each:
-
-| Library             | Used by        | For                                          |
-|---------------------|----------------|----------------------------------------------|
+| Library             | Used by        | For                                           |
+|---------------------|----------------|-----------------------------------------------|
 | `rtrb`              | engine         | lock-free queues to and from the audio thread |
-| `cpal`              | io             | the sound card (PipeWire, ALSA, CoreAudio)   |
-| `midir`             | io             | MIDI ports (ALSA, CoreMIDI)                  |
-| `gilrs`             | io             | gamepads (evdev, IOKit)                      |
-| `crossbeam-channel` | io, program    | channels between normal threads              |
-| `clap`              | program        | the command line                             |
+| `cpal`              | io             | the sound card (PipeWire, ALSA, CoreAudio)    |
+| `midir`             | io             | MIDI ports (ALSA, CoreMIDI)                   |
+| `gilrs`             | io             | gamepads (evdev, IOKit)                       |
+| `crossbeam-channel` | io, program    | channels between normal threads               |
+| `clap`              | program        | the command line                              |
 
-Planned crates:
+## The program
 
-- `trama-plugins`: hosting CLAP plugins first, VST3 later.
+`trama doctor` lists the audio outputs, MIDI ports and gamepads it finds.
+`trama play` runs the step sequencer; everything it needs comes from its
+command-line options.
 
-## 7. Setups, sessions and presets
+Starting:
 
-- A **setup** says which gear is connected, how audio is wired and what
-  controls what. It is a TOML file in `setups/`. Building or tearing down a
-  setup means loading another file.
-- A **session** is what you make with a setup: recorded loops, clips, scenes,
-  parameter values. It is saved as a folder (a session file plus audio files).
-- A **preset** is saved settings for one instrument or effect.
+1. pick the sound card first, because the engine needs its sample rate;
+2. build the engine and split it into controller, processor and MIDI queue;
+3. start the adapters: the synth output (with the MIDI queue), the
+   Launchpad (switched to programmer mode) and the gamepads;
+4. start the audio stream, which moves the processor to the audio thread;
+5. run the core on the main thread: wait up to 1 ms for an input, handle
+   it, then read whatever the engine reported.
 
-A first sketch of a setup file (the format will change):
+Stopping (Ctrl+C):
 
-```toml
-name = "studio"
-
-[audio]
-device = "Scarlett 2i2"
-sample_rate = 48000
-block_size = 128
-
-[devices.pads]
-kind = "launchpad-x"
-
-[devices.mono]
-kind = "midi"
-port = "MiniBrute 2S"
-
-[devices.joy]
-kind = "gamepad"
-
-[tracks.drone]
-source = { audio_input = 1 }
-
-[[mappings]]
-from = "joy.left_stick.x"
-to = "tracks.drone.filter.cutoff"
-range = [200.0, 8000.0]
-curve = "exponential"
-```
-
-User data (samples, recordings, sessions) lives in the standard place for
-each system: `~/.local/share/trama` on Linux and
-`~/Library/Application Support/trama` on macOS.
-
-## 8. User interface
-
-- Trama serves its own **web page** *(planned)*. Open it on the computer, the
-  iPad or the phone.
-- The page is **just another device**: it sends `Command`s and receives
-  `Notification`s, exactly like the Launchpad.
-- It has two modes: **configure** (devices, plugins, mappings, setups) and
-  **play** (mixer, macros, scenes).
-- **Black-box mode**: with no page open, everything keeps working from the
-  controllers.
-- The page is plain HTML, CSS and JavaScript embedded in the `trama` binary,
-  with no JavaScript build step, at least at first.
-- The only native windows will be plugin editors, which bring their own UI.
-
-## 9. Building
-
-[Cargo](https://doc.rust-lang.org/cargo/) is Rust's build tool and package
-manager. Everything goes through it:
-
-| Command                   | What it does                                    |
-|---------------------------|-------------------------------------------------|
-| `cargo run`               | build and start `trama`                         |
-| `cargo run --release`     | optimized build; use it to actually play        |
-| `cargo test`              | run every test in every crate                   |
-| `cargo fmt`               | format the code                                 |
-| `cargo clippy`            | lint: catches common mistakes                   |
-| `cargo deny check`        | check every dependency's license (section 11)   |
-
-- **One workspace, one `Cargo.lock`, one `target/` folder.** `Cargo.lock` is
-  committed: Trama is an application, and both computers should build with
-  exactly the same library versions.
-- **`rust-toolchain.toml`** makes every machine use the latest stable Rust
-  with `rustfmt` and `clippy`.
-- **Debug builds are partly optimized** (see `[profile.dev]` in
-  `Cargo.toml`), because unoptimized audio code can be too slow to sound
-  right.
-- **Each computer builds for itself.** No cross-compiling: Linux builds on
-  Linux, macOS builds on macOS.
-- **CI** (`.github/workflows/ci.yml`) builds, lints and tests on Linux and
-  macOS on every push, so "works on both" is checked by a machine. It runs
-  once the repository is on GitHub.
-
-System libraries for audio, MIDI and gamepads:
-
-- Fedora: `sudo dnf install alsa-lib-devel pipewire-devel clang-devel systemd-devel`
-  (ALSA for MIDI, PipeWire for audio, clang to generate PipeWire's Rust
-  bindings, systemd's libudev for gamepads)
-- macOS: `xcode-select --install`
-
-macOS asks for **microphone permission** before any program can record from
-an audio input, including the Scarlett. The first time Trama records, allow
-it for the terminal you run it from.
-
-## 10. Testing
-
-From fastest to slowest:
-
-1. **Unit tests**, next to the code they test (`#[cfg(test)]` modules). DSP
-   math, core logic, message parsing. They run in milliseconds and need no
-   hardware.
-2. **Offline engine tests.** The engine runs without a sound card: send it
-   `EngineCommand`s, call its process step for N blocks, check the samples.
-   For example "the clip starts exactly at sample 96 000", "this loop is 4
-   bars long", "no NaNs". The same tests can write WAV files to listen to.
-3. **Snapshot tests.** Render a short scene and compare it with a stored
-   reference recording, within a tolerance, to catch unintended changes in
-   the sound.
-4. **Real-time safety tests.** Run the engine processor under
-   `assert_no_alloc`; the test fails if the audio path allocates.
-5. **Adapter tests.** Byte sequences from the real devices' manuals go into
-   an adapter, and we check the `Input`s that come out (and the bytes that
-   light each control).
-6. **End to end, without hardware.** `cargo run -p trama-io --example
-   fake_gear` creates a pretend Launchpad and synth on virtual MIDI ports
-   (Linux and macOS). Point `trama play` at them and it presses pads,
-   plays, stops, and reports the notes the synth got and how steady the
-   MIDI clock was. It needs a running MIDI system, so CI does not run it.
-7. **Hardware smoke tests.** A short manual checklist per device, helped by
-   `trama doctor`, which lists the audio outputs, MIDI ports and gamepads it
-   finds.
-
-CI runs 1 to 5 on Linux and macOS. Numbers 6 and 7 are you, at the
-computer and with the gear.
-
-## 11. License
-
-- Trama is **GPL-3.0-or-later**. The full text is in `LICENSE`, every
-  `Cargo.toml` declares it, and every source file starts with
-  `// SPDX-License-Identifier: GPL-3.0-or-later`.
-- **Every dependency must be GPL-3.0 compatible** (MIT, Apache-2.0, BSD, ISC,
-  Zlib, MPL-2.0, LGPL, GPL-2.0-or-later, ...). `cargo deny check` enforces the
-  list in `deny.toml`, and CI runs it.
-- Known future dependencies are fine: Ableton Link is GPL-2.0-or-later, and
-  the CLAP and VST3 SDKs are MIT.
-- Plugins are separate programs that Trama loads through their standard
-  interfaces, the same way other GPL hosts such as Ardour do. They are not
-  part of Trama's code.
-
-## 12. Roadmap
-
-Each milestone is playable on its own.
-
-0. **Skeleton**: this workspace, the docs, CI. *(done)*
-1. **Gear without synthesis**: open the sound card and run an engine whose
-   only job is keeping time. The Launchpad becomes a step sequencer, the
-   gamepad adds pitch bend, and both drive the MiniBrute 2S over MIDI with
-   MIDI clock. This exercises IO, core, protocol and the clock.
-   *(in progress: works end to end with virtual devices; waiting for a try
-   with the real gear)*
-2. **First sounds**: a simple synth in `trama-dsp`, the engine playing it,
-   offline tests that render to WAV.
-3. **Looper**: record the Scarlett inputs into synced and free loops, with the
-   Launchpad as an 8 × 8 grid of tracks and scenes.
-4. **Samples and disk**: sampler, importing the OP-1's tracks from its disk
-   mode, an always-on recorder that keeps the last few minutes.
-5. **Web interface and setups**: the configure and play pages, setup files.
-6. **Plugins**: CLAP first, then VST3.
-7. **Network**: Ableton Link, two computers, playing as a duo.
+1. the core stops the transport, centers the pitch bend, sends "all notes
+   off" and turns every light off;
+2. the engine gets 100 ms to process the stop and release the last note;
+3. the audio stream closes;
+4. the notification channels close, so each adapter finishes: the Launchpad
+   goes back to its normal mode and the synth output sends what is left.

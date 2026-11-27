@@ -36,7 +36,6 @@ struct Transport {
     /// Sample position of the next clock pulse. Kept as a fraction so pulses
     /// do not drift when a pulse is not a whole number of samples.
     next_pulse_at: f64,
-    /// Pulses since the transport started.
     pulse: u64,
 }
 
@@ -130,7 +129,6 @@ impl EngineProcessor {
         }
     }
 
-    /// One clock pulse at sample `at`.
     fn pulse(&mut self, at: u64) {
         self.send_message(at, MidiMessage::Clock);
 
@@ -160,7 +158,6 @@ impl EngineProcessor {
         self.transport.pulse += 1;
     }
 
-    /// Lets go of the note the sequencer is holding, if any.
     fn release(&mut self, at: u64) {
         if let Some(note) = self.sounding.take() {
             self.send_message(

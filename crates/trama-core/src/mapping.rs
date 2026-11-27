@@ -4,8 +4,7 @@
 //! Going in, they turn an [`Input`] into a [`Command`]. Going out, they
 //! decide how each control should be lit to show the session.
 //!
-//! For now there is one mapping, written in code: the step sequencer. Setup
-//! files (milestone 5) will describe mappings as data instead.
+//! There is one mapping, the step sequencer, written in code.
 
 use trama_protocol::{Action, Color, Command, Control, DeviceId, Input, Light, STEPS};
 
@@ -41,7 +40,6 @@ pub struct StepSequencerMapping {
 }
 
 impl StepSequencerMapping {
-    /// What `input` means, if anything.
     pub fn command(&self, input: &Input) -> Option<Command> {
         if self.pads.as_ref() == Some(&input.device) {
             pads_command(input.control, input.action)

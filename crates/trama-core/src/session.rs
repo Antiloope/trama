@@ -8,7 +8,7 @@ use trama_protocol::{STEPS, StepNote, midi::PITCH_BEND_CENTER};
 use crate::music::Scale;
 
 /// One step of the sequencer: a scale degree, not a fixed note, so changing
-/// the octave or the root moves the whole pattern.
+/// the octave moves the whole pattern.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Step {
     /// Scale degree, 0 = root. Each row of the grid is one degree.
@@ -17,7 +17,6 @@ pub struct Step {
     pub velocity: u8,
 }
 
-/// Lowest and highest octave shift.
 pub const OCTAVE_RANGE: (i8, i8) = (-3, 3);
 
 #[derive(Clone, Debug, PartialEq)]

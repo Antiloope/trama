@@ -9,25 +9,19 @@ use std::time::Instant;
 
 use crate::midi::MidiMessage;
 
-/// Number of steps in the step sequencer.
 pub const STEPS: usize = 8;
 
-/// Slowest tempo Trama accepts.
 pub const MIN_BPM: f64 = 20.0;
 
-/// Fastest tempo Trama accepts.
 pub const MAX_BPM: f64 = 300.0;
 
-/// A note held by one step of the sequencer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StepNote {
-    /// MIDI note number.
     pub pitch: u8,
     /// MIDI velocity, 1 to 127.
     pub velocity: u8,
 }
 
-/// Exactly what the engine must do.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum EngineCommand {
     /// Start the transport at the beginning of the next block.
@@ -44,7 +38,6 @@ pub enum EngineCommand {
     },
 }
 
-/// What the engine reports back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EngineEvent {
     Started,
@@ -56,7 +49,7 @@ pub enum EngineEvent {
     },
 }
 
-/// What the engine sends to the MIDI output, through its own queue.
+/// Sent through its own queue, straight to the MIDI output.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum MidiOut {
     /// Send `message` when the master clock reaches `at_sample`.

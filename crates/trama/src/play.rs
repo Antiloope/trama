@@ -2,7 +2,7 @@
 
 //! `trama play`: the step sequencer.
 //!
-//! Threads, as in `docs/architecture.md`, section 5:
+//! Threads:
 //!
 //! - audio thread (cpal): the engine processor;
 //! - main thread: the core, reading inputs and engine events;

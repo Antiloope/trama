@@ -1413,10 +1413,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "trama-dsp"
-version = "0.1.0"
-
-[[package]]
 name = "trama-engine"
 version = "0.1.0"
 dependencies = [

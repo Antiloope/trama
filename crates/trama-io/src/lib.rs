@@ -11,11 +11,7 @@
 //! - [`midi`]: finding ports, the Launchpad X, MIDI synths;
 //! - [`gamepad`]: joysticks and gamepads.
 //!
-//! Planned: `osc`, `web`, `disk`, `link`.
-//!
 //! Adapters know nothing about the core or the engine: they only translate.
-//!
-//! See `docs/architecture.md`, sections 2 and 6.
 
 pub mod audio;
 mod error;

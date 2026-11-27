@@ -5,8 +5,8 @@
 use std::fmt;
 use std::sync::Arc;
 
-/// The name a setup gives to one connected device, such as `pads`, `synth`
-/// or `joy`. Cheap to clone.
+/// The name Trama gives one connected device, such as `pads`, `synth` or
+/// `joy`. Cheap to clone.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct DeviceId(Arc<str>);
 
@@ -32,8 +32,7 @@ impl fmt::Display for DeviceId {
     }
 }
 
-/// One control on a device. Adapters name their controls; setups refer to
-/// them by those names.
+/// Adapters name their controls; mappings refer to them by those names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Control {
     /// A pad on a grid, counted from the bottom-left corner, starting at 0.
@@ -45,7 +44,6 @@ pub enum Control {
     Axis(&'static str),
 }
 
-/// What happened to a control.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Action {
     /// Pressed, with a velocity between 0.0 and 1.0 (1.0 for buttons that
@@ -54,13 +52,11 @@ pub enum Action {
         velocity: f32,
     },
     Release,
-    /// Moved to `value`.
     Move {
         value: f32,
     },
 }
 
-/// Something happened on a device.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Input {
     pub device: DeviceId,

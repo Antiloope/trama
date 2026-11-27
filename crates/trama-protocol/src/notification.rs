@@ -33,7 +33,6 @@ pub enum LightMode {
     Pulse,
 }
 
-/// How one control should be lit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Light {
     pub color: Color,
@@ -51,7 +50,6 @@ impl Light {
     }
 }
 
-/// What changed.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Notification {
     /// The transport started or stopped, or the tempo changed.
@@ -60,7 +58,6 @@ pub enum Notification {
     Step { step: u8, note: Option<StepNote> },
     /// The sequencer is on step `step`, or stopped if `None`.
     Playhead { step: Option<u8> },
-    /// Light `control` on `device`.
     Light {
         device: DeviceId,
         control: Control,

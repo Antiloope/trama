@@ -4,8 +4,8 @@
 //!
 //! It gets MIDI from two places:
 //!
-//! - the engine's queue: notes and clock placed on exact samples, sent a
-//!   few milliseconds ahead of when they are due;
+//! - the engine's queue: notes and clock placed on exact samples, sent at
+//!   their sample's moment plus a fixed delay;
 //! - notifications addressed to it: live controls such as pitch bend, sent
 //!   right away.
 
@@ -38,7 +38,6 @@ pub enum SynthPort {
     Virtual(String),
 }
 
-/// A running synth output.
 pub struct SynthOutput {
     thread: JoinHandle<()>,
     port: String,

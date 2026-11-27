@@ -10,8 +10,6 @@ publish.workspace = true
 [dependencies]
 rtrb = "0.4.1"
 trama-protocol.workspace = true
-# Also allowed, added when first used: trama-dsp.
-# See docs/architecture.md, section 6.
 
 [lints]
 workspace = true
