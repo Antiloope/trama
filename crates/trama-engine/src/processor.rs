@@ -12,14 +12,19 @@ use trama_protocol::{
     EngineCommand, EngineEvent, MAX_BPM, MIN_BPM, MidiMessage, MidiOut, STEPS, StepNote,
 };
 
-use crate::{EngineConfig, PULSES_PER_QUARTER};
+use crate::graph::{Frames, MAX_FRAMES, PreparedGraph};
+use crate::{EngineConfig, PULSES_PER_QUARTER, ToProcessor};
 
 /// The half of the engine that lives on the audio thread.
 pub struct EngineProcessor {
     config: EngineConfig,
-    commands: Consumer<EngineCommand>,
+    inbox: Consumer<ToProcessor>,
+    /// Graphs the processor stopped running, to be freed on the
+    /// controller's thread.
+    retired: Producer<Box<PreparedGraph>>,
     events: Producer<EngineEvent>,
     midi: Producer<MidiOut>,
+    graph: Box<PreparedGraph>,
     /// Samples computed since the engine started: Trama's master clock.
     position: u64,
     transport: Transport,
@@ -42,15 +47,18 @@ struct Transport {
 impl EngineProcessor {
     pub(crate) fn new(
         config: EngineConfig,
-        commands: Consumer<EngineCommand>,
+        inbox: Consumer<ToProcessor>,
+        retired: Producer<Box<PreparedGraph>>,
         events: Producer<EngineEvent>,
         midi: Producer<MidiOut>,
     ) -> EngineProcessor {
         EngineProcessor {
             config,
-            commands,
+            inbox,
+            retired,
             events,
             midi,
+            graph: Box::new(PreparedGraph::empty()),
             position: 0,
             transport: Transport {
                 playing: false,
@@ -64,22 +72,30 @@ impl EngineProcessor {
         }
     }
 
-    /// Computes one block of audio into `output`, which holds interleaved
-    /// samples for `channels` channels. `now` is the moment the block is
-    /// being computed; the MIDI output uses it to place events in time.
-    pub fn process(&mut self, output: &mut [f32], channels: usize, now: Instant) {
+    /// Computes one block of audio. `input` and `output` hold interleaved
+    /// samples for `input_channels` and `output_channels` channels; the
+    /// block is as long as `output`, and whatever `input` lacks is silence.
+    /// `now` is the moment the block is being computed; the MIDI output
+    /// uses it to place events in time.
+    pub fn process(
+        &mut self,
+        input: &[f32],
+        input_channels: usize,
+        output: &mut [f32],
+        output_channels: usize,
+        now: Instant,
+    ) {
         output.fill(0.0);
-        let frames = (output.len() / channels.max(1)) as u64;
+        let output_channels = output_channels.max(1);
+        let frames = output.len() / output_channels;
         let block_start = self.position;
-        let block_end = block_start + frames;
+        let block_end = block_start + frames as u64;
 
         self.send_midi(MidiOut::Anchor {
             sample: block_start,
             at: now,
         });
-        while let Ok(command) = self.commands.pop() {
-            self.apply(command, block_start);
-        }
+        self.read_inbox(block_start);
         if self.transport.playing {
             while self.transport.next_pulse_at < block_end as f64 {
                 // `next_pulse_at` is never before the block, so this lands
@@ -88,6 +104,20 @@ impl EngineProcessor {
                 self.pulse(at);
                 self.transport.next_pulse_at += self.transport.samples_per_pulse;
             }
+        }
+
+        let mut offset = 0;
+        while offset < frames {
+            let len = (frames - offset).min(MAX_FRAMES);
+            self.graph.run(Frames {
+                input,
+                input_channels,
+                output: &mut *output,
+                output_channels,
+                offset,
+                len,
+            });
+            offset += len;
         }
         self.position = block_end;
     }
@@ -100,6 +130,27 @@ impl EngineProcessor {
     /// Messages lost so far because a queue was full.
     pub fn dropped_messages(&self) -> u64 {
         self.dropped
+    }
+
+    /// Applies commands and swaps graphs in the order they were sent. A
+    /// graph waits, and everything sent after it, while there is no room to
+    /// hand the old one back: the processor never frees a graph itself.
+    fn read_inbox(&mut self, at: u64) {
+        while let Ok(next) = self.inbox.peek() {
+            if matches!(next, ToProcessor::Graph(_)) && self.retired.is_full() {
+                return;
+            }
+            match self.inbox.pop() {
+                Ok(ToProcessor::Command(command)) => self.apply(command, at),
+                Ok(ToProcessor::Graph(graph)) => {
+                    let old = std::mem::replace(&mut self.graph, graph);
+                    // There is room: checked above, and only this thread
+                    // pushes.
+                    let _ = self.retired.push(old);
+                }
+                Err(_) => return,
+            }
+        }
     }
 
     fn apply(&mut self, command: EngineCommand, at: u64) {

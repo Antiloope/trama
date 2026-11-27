@@ -68,6 +68,7 @@ The message types live in `trama-protocol`.
 | `EngineEvent`   | what the engine reports back             | step 4 started at sample 1 512 000          |
 | `Notification`  | what changed                             | light pad (3, 4) on `pads` blue             |
 | `MidiOut`       | MIDI that must land on an exact sample   | note on F2 at sample 1 512 000              |
+| `GraphDescription` | the audio patch the engine runs       | input 1 → gain → output 1 and output 2      |
 
 `Input` is about devices ("this pad"). `Command` is about music ("this
 step"). The **mapping** is the bridge between the two, and it works in both
@@ -120,11 +121,33 @@ core, because notes and clock must land on the beat (see "Time").
 | Owner         | What it owns                                                                             |
 |---------------|------------------------------------------------------------------------------------------|
 | Core          | The session: pattern, tempo, transport, octave, root and scale, the last pitch bend and modulation sent, what each pad shows |
-| Engine        | Its copy of the pattern, the note it is holding, the transport's position, the master clock |
+| Engine        | Its copy of the pattern, the note it is holding, the transport's position, the master clock, the audio graph it runs and the level of each gain |
 | IO adapters   | Their connections; the synth output also keeps the MIDI waiting to be sent              |
 
 The core is the single source of truth for the session. Anything that wants
 to change it sends a `Command`.
+
+## The audio graph
+
+The engine runs an audio graph: nodes with jacks, and cables between them,
+like a patchbay. A `GraphDescription` lists them:
+
+- **nodes**: one channel of the sound card's input (`AudioInput`), one
+  channel of its output (`AudioOutput`), a gain (`Gain`);
+- **cables**: from an output jack of a node to an input jack of another.
+  Every cable carries one channel, so stereo is two cables. An output jack
+  can feed any number of cables, cables that reach the same input jack are
+  summed, and cables never form a loop.
+
+The description is plain data and knows nothing about who wrote it. The
+engine's controller checks it and **prepares** it off the audio thread:
+it works out the order to run the nodes in (every node after the ones it
+listens to) and allocates a buffer for every output jack. Running a
+prepared graph never allocates. Blocks longer than 1024 frames run in
+pieces, so the buffers have a fixed size.
+
+A channel the sound card does not have is silent, and a sample that is
+not a number never reaches the card.
 
 ## Time
 

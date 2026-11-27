@@ -58,6 +58,19 @@ port for the synth and uses a grid controller only if one is connected.
 There is one layout, the step sequencer, so it is written in code. That
 keeps it simple and shows exactly what a mapping needs to express.
 
+## The audio graph is a patchbay
+
+Audio goes through nodes connected by cables, the way gear is connected
+with a patchbay, so anything that makes or changes sound plugs into the
+same place. Each cable carries one channel: a microphone is one cable and
+a stereo synth two, and nothing assumes a channel count. Cables that meet
+at a jack are summed, as on a mixer. Loops are refused, because a graph
+without loops has an order to run its nodes in.
+
+The patch is a `GraphDescription` in `trama-protocol`, plain data that any
+layer can write and that knows nothing about who wrote it. The engine
+prepares it into a graph it can run.
+
 ## cpal's native PipeWire backend on Linux
 
 PipeWire is the sound server of most current Linux desktops, and talking

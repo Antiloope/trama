@@ -207,7 +207,7 @@ pub fn run(args: PlayArgs) -> anyhow::Result<()> {
     .context("listening for Ctrl+C")?;
 
     let audio = output.start(move |buffer, channels, now| {
-        processor.process(buffer, channels, now);
+        processor.process(&[], 0, buffer, channels, now);
     })?;
 
     println!(

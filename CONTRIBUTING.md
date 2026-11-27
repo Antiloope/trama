@@ -36,9 +36,10 @@ From fastest to slowest:
    note names, Launchpad bytes, gamepad events, the clock map.
 2. **The core as a black box** (`crates/trama-core/tests`): inputs in,
    engine commands and notifications out.
-3. **The engine offline** (`crates/trama-engine/tests/offline.rs`): it runs
-   without a sound card, and the tests check which MIDI comes out on which
-   sample, for several block sizes.
+3. **The engine offline** (`crates/trama-engine/tests`): it runs without a
+   sound card. `offline.rs` checks which MIDI comes out on which sample,
+   for several block sizes; `graph.rs` feeds the audio graph synthetic
+   input and checks exactly what comes out.
 4. **Real-time safety** (`crates/trama-engine/tests/realtime.rs`): the
    processor runs under `assert_no_alloc`, which aborts the test if the
    audio path allocates.
