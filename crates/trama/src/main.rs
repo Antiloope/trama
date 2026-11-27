@@ -24,10 +24,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// List the audio outputs, MIDI ports and gamepads Trama can see.
+    /// List the audio outputs and inputs, MIDI ports and gamepads Trama can
+    /// see.
     Doctor,
     /// Play the step sequencer: a MIDI synth driven by a Launchpad X and
-    /// gamepads, in time with the sound card.
+    /// gamepads, in time with the sound card, whose inputs can play through
+    /// Trama to its outputs.
     Play(play::PlayArgs),
 }
 

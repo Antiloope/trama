@@ -86,6 +86,42 @@ over 10 ms. A fixed time rather than one block keeps the sound the same
 whatever the block size, which can be under a millisecond or near a
 hundred.
 
+## Input and output share one clock
+
+Two sound cards each have a clock of their own, and over minutes they
+drift apart: the input arrives a little faster or slower than the output
+plays. Trama does not correct that. It plays an input only through an
+output on the same clock, and the cushion between the two streams only
+absorbs which callback runs first:
+
+- on PipeWire, any input and output, because PipeWire runs every stream
+  of one program in the same cycle and adapts the devices to it;
+- elsewhere, the input of the output device itself. On macOS, an
+  aggregate device made in Audio MIDI Setup joins several devices on one
+  clock.
+
+Trama refuses an input on another clock instead of letting it click every
+few minutes. Correcting the drift means resampling, which touches only the
+sound card adapter in `trama-io`: the engine receives blocks of input
+either way.
+
+## The cushion starts at one block and grows
+
+Waiting for more input before playing it means fewer gaps and more delay.
+The cushion starts at one block, the least that works when the output
+callback runs before the input one, and grows by a block at each underrun,
+up to four, so a system that needs more gets it and one that does not
+keeps the shortest delay. Monitoring also feels the block size itself:
+`--block-size` asks for smaller blocks.
+
+## Inputs stay closed and monitoring starts muted
+
+`trama play` opens an input only when `--audio-in` names one. Opening a
+microphone shows that it is in use on Linux desktops and asks for
+permission on macOS, which no one should meet just to run the sequencer.
+When an input is open, monitoring starts muted, because a microphone next
+to speakers howls, and nothing is connected until `--connect` says so.
+
 ## cpal's native PipeWire backend on Linux
 
 PipeWire is the sound server of most current Linux desktops, and talking

@@ -11,7 +11,8 @@ Trama connects instruments and controllers and plays them together, in time
 with the sound card. It runs an 8-step sequencer: a grid controller edits
 the pattern and shows the playhead, a gamepad adds pitch bend and
 modulation, and a synth with a MIDI input plays the notes and follows
-Trama's MIDI clock.
+Trama's MIDI clock. Whatever reaches the sound card's inputs, a synth's
+audio or a microphone, can play through Trama to its outputs.
 
 Trama does three jobs, and each job is a layer:
 
@@ -36,15 +37,15 @@ Trama does three jobs, and each job is a layer:
         │ EngineCommand      ▲ EngineEvent        │
         ▼                    │                    │
  ┌────────────────────────────────────────────────────────────┐
- │ ENGINE   transport, MIDI clock, step sequencer             │
+ │ ENGINE   transport, MIDI clock, sequencer, audio graph     │
  └────────────────────────────────────────────────────────────┘
-        │ silence, one block at a time
-        ▼
- PipeWire or ALSA (Linux), CoreAudio (macOS) → sound card
+        ▲ input block                │ output block
+        │                            ▼
+ PipeWire or ALSA (Linux), CoreAudio (macOS) ↔ sound card
 ```
 
-The engine writes silence: the sound card is there as Trama's clock. The
-piece of IO that opens it only hands each block to the engine; audio never
+The sound card is Trama's clock. The piece of IO that opens it hands each
+block of input to the engine and takes a block of output back; audio never
 passes through the core.
 
 Three rules hold everything together:
@@ -162,6 +163,37 @@ and the level glides to its new value over 10 ms, whatever the block
 size, so changes do not click. A gain that is in both the old graph and
 the new one keeps the level it was at and glides to its new one.
 
+## Audio input
+
+cpal opens a sound card's input and output as two streams, each with a
+callback on an audio thread of its own. The input callback writes into a
+lock-free ring buffer, and the output callback reads from it and hands the
+engine both blocks:
+
+```
+ input stream ──▶ ring buffer (the cushion) ──▶ output stream ──▶ engine
+```
+
+Either callback may run first in a cycle, so the output waits for a
+**cushion** of one block of input before it plays any, and plays silence
+until then. When the input runs out (an **underrun**) the missing frames
+are silent, the cushion grows by a block, up to four, and the output
+waits for it to fill again. Input that finds the ring full, or that piles
+up beyond the cushion while the output was not reading, is dropped (an
+**overrun**). `trama play` reports both, at most once a second.
+
+The cushion keeps input and output in step only if they share a clock
+(see decisions.md). With PipeWire they always do: cpal puts both streams
+in one group, and PipeWire runs them in the same cycle whatever the
+devices. Elsewhere the input must be the output device itself; on macOS,
+Audio MIDI Setup can join several devices into one aggregate device.
+PipeWire also offers each output as an input that records what plays on
+it; Trama leaves those out, so it never records itself.
+
+The input opens with every channel the device offers, at the output's
+sample rate and block size. `--block-size` asks the system for smaller
+blocks, which shortens the delay between input and output.
+
 ## Time
 
 **The sound card is the clock.** At 48 kHz with blocks of 1024 samples, it
@@ -202,7 +234,8 @@ come out within a fraction of a millisecond of where they belong.
 
 ```
   ┌──────────────────────────────────────────┐
-  │ audio thread (real-time)                 │  engine processor
+  │ audio threads (real-time)                │  engine processor on the
+  │                                          │  output stream, input stream
   └──────────▲──────────────────┬────────────┘
              │  lock-free queues: fixed size, never block
   ┌──────────┴──────────────────▼────────────┐
@@ -252,7 +285,7 @@ trama/
 │   ├── trama-protocol/   the messages every layer speaks
 │   ├── trama-engine/     the real-time engine (no devices, no sound card)
 │   ├── trama-core/       the brain: session state, mapping, scales
-│   ├── trama-io/         adapters: sound card, Launchpad X, synths, gamepads
+│   ├── trama-io/         adapters: sound card in and out, Launchpad X, synths, gamepads
 │   └── trama/            the program: wires everything together
 ├── docs/                 this document and the decision log
 └── scripts/              repository checks
@@ -289,7 +322,7 @@ The main outside libraries:
 
 | Library             | Used by        | For                                           |
 |---------------------|----------------|-----------------------------------------------|
-| `rtrb`              | engine         | lock-free queues to and from the audio thread |
+| `rtrb`              | engine, io     | lock-free queues to and from the audio threads |
 | `cpal`              | io             | the sound card (PipeWire, ALSA, CoreAudio)    |
 | `midir`             | io             | MIDI ports (ALSA, CoreMIDI)                   |
 | `gilrs`             | io             | gamepads (evdev, IOKit)                       |
@@ -298,25 +331,37 @@ The main outside libraries:
 
 ## The program
 
-`trama doctor` lists the audio outputs, MIDI ports and gamepads it finds.
-`trama play` runs the step sequencer; everything it needs comes from its
+`trama doctor` lists the audio outputs and inputs, with their channels, and
+the MIDI ports and gamepads it finds. `trama play` runs the step sequencer
+and monitors the sound card's inputs; everything it needs comes from its
 command-line options.
+
+`trama play` builds its audio graph from `--connect IN:OUT`: each input
+channel named in a cable goes through a gain of its own, and its cables
+meet at a monitoring level for each output channel, then reach that
+output. Monitoring starts muted, because a microphone next to speakers
+howls; `--monitor <dB>` turns it up with a command once the graph is in
+place. Without `--connect`, nothing is connected.
 
 Starting:
 
-1. pick the sound card first, because the engine needs its sample rate;
+1. pick the sound card first, because the engine needs its sample rate,
+   and the input, if `--audio-in` names one;
 2. build the engine and split it into controller, processor and MIDI queue;
+   hand the controller the monitoring graph and the monitoring level;
 3. start the adapters: the synth output (with the MIDI queue), the
    Launchpad (switched to programmer mode) and the gamepads;
-4. start the audio stream, which moves the processor to the audio thread;
+4. start the audio streams, which moves the processor to the audio thread;
 5. run the core on the main thread: wait up to 1 ms for an input, handle
-   it, then read whatever the engine reported.
+   it, then read whatever the engine reported and how the audio input is
+   doing.
 
 Stopping (Ctrl+C):
 
 1. the core stops the transport, centers the pitch bend, sends "all notes
-   off" and turns every light off;
-2. the engine gets 100 ms to process the stop and release the last note;
-3. the audio stream closes;
+   off" and turns every light off; monitoring is muted;
+2. the engine gets 100 ms to process the stop, release the last note and
+   fade monitoring out;
+3. the audio streams close;
 4. the notification channels close, so each adapter finishes: the Launchpad
    goes back to its normal mode and the synth output sends what is left.

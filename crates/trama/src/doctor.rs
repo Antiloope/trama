@@ -5,15 +5,12 @@
 use trama_io::{audio, gamepad, midi};
 
 pub fn run() -> anyhow::Result<()> {
-    match audio::list_outputs() {
+    match audio::list_devices() {
         Ok(report) => {
-            println!("Audio outputs ({}):", report.host);
-            for (name, is_default) in report.outputs {
-                let mark = if is_default { "  (default)" } else { "" };
-                println!("  {name}{mark}");
-            }
+            print_audio(&format!("Audio outputs ({})", report.host), &report.outputs);
+            print_audio(&format!("Audio inputs ({})", report.host), &report.inputs);
         }
-        Err(error) => println!("Audio outputs: {error}"),
+        Err(error) => println!("Audio devices: {error}"),
     }
 
     match midi::list_ports() {
@@ -29,6 +26,22 @@ pub fn run() -> anyhow::Result<()> {
         Err(error) => println!("Gamepads: {error}"),
     }
     Ok(())
+}
+
+fn print_audio(title: &str, devices: &[audio::DeviceInfo]) {
+    println!("{title}:");
+    if devices.is_empty() {
+        println!("  (none)");
+    }
+    for device in devices {
+        let channels = match device.channels {
+            Some(1) => ", 1 channel".to_string(),
+            Some(n) => format!(", {n} channels"),
+            None => String::new(),
+        };
+        let mark = if device.is_default { "  (default)" } else { "" };
+        println!("  {}{channels}{mark}", device.name);
+    }
 }
 
 fn print_list(title: &str, items: &[String]) {
