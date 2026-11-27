@@ -16,16 +16,20 @@ pub const TEMPO_NUDGE: f64 = 5.0;
 /// Number of rows on the grid, one scale degree each.
 pub const ROWS: u8 = 8;
 
+const TOP_ROW: u8 = ROWS - 1;
+const BOTTOM_ROW: u8 = 0;
+
 /// The step sequencer layout.
 ///
-/// Pad grid (Launchpad X):
+/// Pad grid, on any grid controller (it uses 8 × 8 pads; a smaller grid
+/// reaches only the steps and degrees it has):
 ///
 /// - each column is a step (left to right), each row a scale degree (root
 ///   at the bottom);
 /// - `up` / `down` move the pattern an octave; `left` / `right` change the
 ///   tempo;
-/// - `scene_1` (top right) starts and stops; `scene_8` (bottom right)
-///   clears the pattern.
+/// - the row button beside the top row starts and stops; the one beside
+///   the bottom row clears the pattern.
 ///
 /// Gamepad:
 ///
@@ -75,14 +79,17 @@ impl StepSequencerMapping {
             (Control::Button("left"), Light::solid(Color::Dim)),
             (Control::Button("right"), Light::solid(Color::Dim)),
             (
-                Control::Button("scene_1"),
+                Control::RowButton { row: TOP_ROW },
                 Light::solid(if session.playing {
                     Color::Green
                 } else {
                     Color::Red
                 }),
             ),
-            (Control::Button("scene_8"), Light::solid(Color::Pink)),
+            (
+                Control::RowButton { row: BOTTOM_ROW },
+                Light::solid(Color::Pink),
+            ),
         ]);
         lights
     }
@@ -100,13 +107,13 @@ fn pads_command(control: Control, action: Action) -> Option<Command> {
                 velocity,
             })
         }
+        Control::RowButton { row: TOP_ROW } => Some(Command::TogglePlay),
+        Control::RowButton { row: BOTTOM_ROW } => Some(Command::ClearPattern),
         Control::Button(name) => match name {
             "up" => Some(Command::ShiftOctave { octaves: 1 }),
             "down" => Some(Command::ShiftOctave { octaves: -1 }),
             "left" => Some(Command::NudgeTempo { bpm: -TEMPO_NUDGE }),
             "right" => Some(Command::NudgeTempo { bpm: TEMPO_NUDGE }),
-            "scene_1" => Some(Command::TogglePlay),
-            "scene_8" => Some(Command::ClearPattern),
             _ => None,
         },
         _ => None,

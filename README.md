@@ -4,15 +4,24 @@ Trama connects synths, MIDI controllers and gamepads and plays them together,
 in time with the sound card, without a DAW. It is free software written in
 Rust, and runs on Linux and macOS.
 
-It runs an 8-step sequencer: a Launchpad X edits the pattern and shows the
-playhead, a gamepad adds pitch bend and modulation, and a MIDI synth (an
-Arturia MiniBrute 2S, a Teenage Engineering OP-1, anything with a MIDI input)
-plays the notes and follows Trama's MIDI clock.
+It runs an 8-step sequencer: a grid controller edits the pattern and shows
+the playhead, a gamepad adds pitch bend and modulation, and a synth with a
+MIDI input plays the notes and follows Trama's MIDI clock.
+
+## Supported devices
+
+| Kind             | What works                                                            |
+|------------------|-----------------------------------------------------------------------|
+| Sound cards      | any output the system offers (PipeWire or ALSA on Linux, CoreAudio on macOS) |
+| Synths           | anything with a MIDI input: hardware, or a program on a virtual MIDI port |
+| Grid controllers | Novation Launchpad X                                                  |
+| Gamepads         | those gilrs recognises (evdev on Linux, IOKit on macOS)               |
 
 ## Build
 
 Install Rust from [rustup.rs](https://rustup.rs) and the system libraries:
 
+- Debian and Ubuntu: `sudo apt install pkg-config libasound2-dev libpipewire-0.3-dev libclang-dev libudev-dev`
 - Fedora: `sudo dnf install alsa-lib-devel pipewire-devel clang-devel systemd-devel`
 - macOS: `xcode-select --install`
 
@@ -24,18 +33,23 @@ See what Trama can find (audio outputs, MIDI ports, gamepads):
 cargo run -- doctor
 ```
 
-Play the step sequencer with a Launchpad X and a synth whose MIDI port name
-contains "MiniBrute":
+Play the step sequencer on a synth, naming its MIDI port (part of the name
+`trama doctor` shows):
 
 ```sh
-cargo run --release -- play
+cargo run --release -- play --synth "My Synth"
 ```
+
+Without `--synth`, Trama creates a virtual MIDI port named "trama synth" for
+a synth or another program to connect to. It uses a grid controller and
+gamepads if they are connected.
 
 Useful options (`cargo run -- play --help` lists them all):
 
 | Option             | Default    | Meaning                                                   |
 |--------------------|------------|-----------------------------------------------------------|
-| `--synth <name>`   | MiniBrute  | synth MIDI port; `virtual` makes a port to connect to     |
+| `--synth <name>`   | virtual    | synth MIDI port; `virtual` makes a port to connect to     |
+| `--pads <name>`    | a Launchpad X, if connected | grid controller MIDI port; `none` leaves it out |
 | `--channel <n>`    | 1          | MIDI channel the synth listens on                         |
 | `--root <note>`    | C2         | note of the bottom row                                    |
 | `--scale <name>`   | minor      | major, minor, dorian, phrygian, pentatonic-minor, chromatic |
@@ -45,9 +59,9 @@ Useful options (`cargo run -- play --help` lists them all):
 
 Controls:
 
-- **Launchpad X**: each column is a step, each row a scale degree (root at
-  the bottom). Top-right side button: play/stop. Bottom-right: clear.
-  Up/down: octave. Left/right: tempo.
+- **Grid**: each column is a step, each row a scale degree (root at the
+  bottom). The button beside the top row: play/stop; beside the bottom row:
+  clear. Up/down: octave. Left/right: tempo.
 - **Gamepad**: A plays/stops, the left stick bends pitch, the right trigger is
   the modulation wheel, the D-pad does octave and tempo.
 

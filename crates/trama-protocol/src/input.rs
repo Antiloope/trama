@@ -32,12 +32,22 @@ impl fmt::Display for DeviceId {
     }
 }
 
-/// Adapters name their controls; mappings refer to them by those names.
+/// A control on a device, named by what kind of control it is rather than by
+/// the model it is on, so a mapping works with every device of the same kind.
+///
+/// - Grid controllers report their pads as [`Control::Pad`], the buttons
+///   beside the rows as [`Control::RowButton`], and their arrow buttons as
+///   `"up"`, `"down"`, `"left"` and `"right"`.
+/// - Gamepads use the Xbox layout's positions: `"south"` (A), `"east"`,
+///   `"north"`, `"west"`, `"dpad_up"`, `"left_bumper"`, `"start"` and so on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Control {
     /// A pad on a grid, counted from the bottom-left corner, starting at 0.
     Pad { row: u8, column: u8 },
-    /// A button, such as `"up"`, `"scene_1"` or `"south"`.
+    /// The button beside row `row` of a grid, counted like pads.
+    RowButton { row: u8 },
+    /// A button, such as `"up"` or `"south"`. A button that only one model
+    /// has keeps that model's label, such as `"capture"`.
     Button(&'static str),
     /// Something that moves: a stick (-1.0 to 1.0) or a trigger (0.0 to 1.0),
     /// such as `"left_stick_y"` or `"right_trigger"`.

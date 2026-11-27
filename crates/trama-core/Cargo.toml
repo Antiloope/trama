@@ -1,6 +1,6 @@
 [package]
 name = "trama-core"
-description = "Trama's brain: session state, setups, mappings, scenes"
+description = "Trama's brain: session state and mappings"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

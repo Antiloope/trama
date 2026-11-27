@@ -53,6 +53,20 @@ fn button(name: &'static str) -> Input {
     press(pads(), Control::Button(name))
 }
 
+fn row_button(row: u8) -> Input {
+    press(pads(), Control::RowButton { row })
+}
+
+/// The row button beside the top row: play / stop.
+fn play_button() -> Input {
+    row_button(7)
+}
+
+/// The row button beside the bottom row: clear the pattern.
+fn clear_button() -> Input {
+    row_button(0)
+}
+
 fn stick(name: &'static str, value: f32) -> Input {
     Input {
         device: joy(),
@@ -211,11 +225,11 @@ fn octave_stops_at_three_up() {
 #[test]
 fn play_button_starts_and_stops() {
     let mut core = core();
-    let out = core.handle_input(&button("scene_1"));
+    let out = core.handle_input(&play_button());
     assert_eq!(engine_commands(&out), vec![EngineCommand::Play]);
-    assert!(lights(&out).contains(&(Control::Button("scene_1"), Light::solid(Color::Green))));
+    assert!(lights(&out).contains(&(Control::RowButton { row: 7 }, Light::solid(Color::Green))));
 
-    let out = core.handle_input(&button("scene_1"));
+    let out = core.handle_input(&play_button());
     assert_eq!(engine_commands(&out), vec![EngineCommand::Stop]);
 }
 
@@ -236,7 +250,7 @@ fn tempo_buttons_nudge_by_five() {
 fn the_playhead_moves_a_dim_column_and_turns_notes_green() {
     let mut core = core();
     core.handle_input(&pad(0, 1));
-    core.handle_input(&button("scene_1"));
+    core.handle_input(&play_button());
 
     let out = core.handle_engine_event(EngineEvent::StepStarted {
         step: 1,
@@ -262,7 +276,7 @@ fn clear_empties_every_step() {
     let mut core = core();
     core.handle_input(&pad(0, 1));
     core.handle_input(&pad(3, 6));
-    let out = core.handle_input(&button("scene_8"));
+    let out = core.handle_input(&clear_button());
     assert_eq!(
         engine_commands(&out),
         vec![
@@ -331,7 +345,7 @@ fn unknown_devices_and_controls_do_nothing() {
 fn shutdown_stops_silences_and_turns_everything_off() {
     let mut core = core();
     core.handle_input(&pad(0, 0));
-    core.handle_input(&button("scene_1"));
+    core.handle_input(&play_button());
     let out = core.shutdown();
     assert_eq!(engine_commands(&out), vec![EngineCommand::Stop]);
     assert!(lights(&out).iter().all(|(_, light)| *light == Light::OFF));

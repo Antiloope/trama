@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! A MIDI synth (the MiniBrute 2S, the OP-1, anything with a MIDI input).
+//! A synth with a MIDI input: hardware, or a program on a virtual port.
 //!
 //! It gets MIDI from two places:
 //!

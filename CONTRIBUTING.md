@@ -4,10 +4,11 @@
 
 1. Install Rust with [rustup](https://rustup.rs). `rust-toolchain.toml`
    picks the latest stable release with `rustfmt` and `clippy`.
-2. Install the system libraries:
-   - Fedora: `sudo dnf install alsa-lib-devel pipewire-devel clang-devel systemd-devel`
-     (ALSA for MIDI, PipeWire for audio, clang to generate PipeWire's Rust
-     bindings, systemd's libudev for gamepads);
+2. Install the system libraries: ALSA for MIDI, PipeWire for audio,
+   libclang to generate PipeWire's Rust bindings, libudev for gamepads.
+   - Debian and Ubuntu: `sudo apt install pkg-config libasound2-dev libpipewire-0.3-dev libclang-dev libudev-dev`
+     (what CI installs);
+   - Fedora: `sudo dnf install alsa-lib-devel pipewire-devel clang-devel systemd-devel`;
    - macOS: `xcode-select --install`.
 
 ## Everyday commands
@@ -94,6 +95,15 @@ file before the agent finishes. Agents read the same rules from `AGENTS.md`
   before adding it there.
 - No `unsafe`: the workspace lints forbid it.
 - Crates depend on each other only as `docs/architecture.md` describes.
+- Trama works with whatever gear its user has:
+  - code that knows a particular model of device lives only in that model's
+    adapter in `trama-io`;
+  - the protocol, the core and the engine talk about kinds of controls
+    (pads, row buttons, arrows, gamepad buttons and sticks), never about
+    models;
+  - defaults never assume a particular device;
+  - code, comments and docs name a model only where Trama has an adapter
+    for it; examples use made-up names ("My Synth").
 - Nothing on the audio thread may allocate, lock, block, print or touch
   files.
 

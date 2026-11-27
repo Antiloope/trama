@@ -42,6 +42,17 @@ callbacks are only ever late. Messages go out 10 ms after their sample's
 time, so the MIDI thread is never the one making them late. Live controls
 such as pitch bend skip the queue and go out at once.
 
+## Devices are described by kind, not by model
+
+Trama works with whatever gear its user has. Only an adapter in `trama-io`
+knows a particular model: it names that model's controls by kind (a pad on
+a grid, the button beside a row, a gamepad's `south` button) and sends
+`Input`s in those terms. The protocol, the core and the engine never name a
+model, so a mapping works with every device of its kind, and supporting a
+new model means writing its adapter and nothing else. Defaults never assume
+a particular device: with no options, `trama play` creates a virtual MIDI
+port for the synth and uses a grid controller only if one is connected.
+
 ## The mapping is code
 
 There is one layout, the step sequencer, so it is written in code. That
@@ -49,9 +60,10 @@ keeps it simple and shows exactly what a mapping needs to express.
 
 ## cpal's native PipeWire backend on Linux
 
-PipeWire is what Fedora runs, and talking to it directly avoids an extra
-ALSA layer. cpal falls back to ALSA when PipeWire is not running. Building it
-needs `pipewire-devel` and `clang-devel`.
+PipeWire is the sound server of most current Linux desktops, and talking
+to it directly avoids an extra ALSA layer. cpal falls back to ALSA when
+PipeWire is not running. Building it needs PipeWire's development files and
+libclang (the README lists the packages).
 
 ## Code and docs in English
 
