@@ -3,16 +3,22 @@
 //! The real-time engine.
 //!
 //! The engine runs one small block of samples at a time and keeps Trama's
-//! master clock by counting them. It writes silence: its job is keeping
-//! time. It runs the transport, sends MIDI clock and plays the step
-//! sequencer, all placed on exact samples.
+//! master clock by counting them. It runs the transport, sends MIDI clock
+//! and plays the step sequencer, all placed on exact samples, and it runs
+//! an audio graph: the patch of nodes and cables that turns the sound
+//! card's input into its output.
 //!
 //! It is split in two halves that talk through lock-free queues:
 //!
 //! - the [`EngineController`] lives on a normal thread (the core's): it
-//!   sends [`EngineCommand`]s and reads [`EngineEvent`]s;
+//!   sends [`EngineCommand`]s, prepares graphs and hands them over, and
+//!   reads [`EngineEvent`]s;
 //! - the [`EngineProcessor`] lives on the audio thread: it applies what it
 //!   receives and computes audio. It never allocates, locks or blocks.
+//!
+//! Graphs are swapped, never built, on the audio thread: the processor
+//! hands the graph it stops running back through another queue, and the
+//! controller frees it.
 //!
 //! A third queue carries [`MidiOut`] from the processor straight to the MIDI
 //! output, because notes and clock must land on the beat.
@@ -20,14 +26,21 @@
 //! The engine knows nothing about sound cards or devices: it is just "audio
 //! in, audio out". That is what lets tests run it offline.
 
+mod graph;
 mod processor;
 
+pub use graph::GraphError;
+use graph::PreparedGraph;
 pub use processor::EngineProcessor;
 use rtrb::{Consumer, Producer, RingBuffer};
-use trama_protocol::{Channel, EngineCommand, EngineEvent, MidiOut};
+use trama_protocol::{Channel, EngineCommand, EngineEvent, GraphDescription, MidiOut};
 
 /// MIDI clock pulses per quarter note, fixed by the MIDI standard.
 pub const PULSES_PER_QUARTER: u32 = 24;
+
+/// How long a gain takes to reach a new level, so changes do not click,
+/// whatever the block size.
+pub const RAMP_SECONDS: f64 = 0.010;
 
 /// How the engine is set up. It cannot change while running.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -66,21 +79,36 @@ pub struct Engine {
 }
 
 /// How many messages each queue can hold before new ones are dropped.
-const COMMAND_QUEUE: usize = 1024;
+const INBOX_QUEUE: usize = 1024;
 const EVENT_QUEUE: usize = 1024;
 const MIDI_QUEUE: usize = 8192;
+/// How many graphs can be on their way to the processor or back. The
+/// controller never sends more, so the processor always has room to hand
+/// the old graph back.
+const GRAPHS_IN_FLIGHT: usize = 8;
+
+/// What crosses to the processor, in the order it was sent. A graph is a
+/// pointer, so this stays small and fixed-size.
+pub(crate) enum ToProcessor {
+    Command(EngineCommand),
+    Graph(Box<PreparedGraph>),
+}
 
 impl Engine {
+    /// The processor starts with an empty graph, which outputs silence.
     pub fn new(config: EngineConfig) -> Engine {
-        let (command_tx, command_rx) = RingBuffer::new(COMMAND_QUEUE);
+        let (inbox_tx, inbox_rx) = RingBuffer::new(INBOX_QUEUE);
+        let (retired_tx, retired_rx) = RingBuffer::new(GRAPHS_IN_FLIGHT);
         let (event_tx, event_rx) = RingBuffer::new(EVENT_QUEUE);
         let (midi_tx, midi_rx) = RingBuffer::new(MIDI_QUEUE);
         Engine {
             controller: EngineController {
-                commands: command_tx,
+                inbox: inbox_tx,
+                retired: retired_rx,
+                graphs_in_flight: 0,
                 events: event_rx,
             },
-            processor: EngineProcessor::new(config, command_rx, event_tx, midi_tx),
+            processor: EngineProcessor::new(config, inbox_rx, retired_tx, event_tx, midi_tx),
             midi: midi_rx,
         }
     }
@@ -88,20 +116,53 @@ impl Engine {
 
 /// The half of the engine that lives on a normal thread.
 pub struct EngineController {
-    commands: Producer<EngineCommand>,
+    inbox: Producer<ToProcessor>,
+    retired: Consumer<Box<PreparedGraph>>,
+    /// Graphs sent whose predecessors have not come back yet.
+    graphs_in_flight: usize,
     events: Consumer<EngineEvent>,
 }
 
 impl EngineController {
     /// Queues `command` for the processor. It takes effect at the start of
-    /// the next block. Gives the command back if the queue is full.
+    /// the next block, after everything sent before it. Gives the command
+    /// back if the queue is full.
     pub fn send(&mut self, command: EngineCommand) -> Result<(), EngineCommand> {
-        self.commands
-            .push(command)
-            .map_err(|rtrb::PushError::Full(c)| c)
+        self.free_retired_graphs();
+        match self.inbox.push(ToProcessor::Command(command)) {
+            Ok(()) => Ok(()),
+            Err(rtrb::PushError::Full(_)) => Err(command),
+        }
+    }
+
+    /// Prepares `description` here, off the audio thread, and queues it. The
+    /// processor starts running it at the start of the next block, after
+    /// everything sent before it; commands sent afterwards reach the new
+    /// graph.
+    pub fn set_graph(&mut self, description: &GraphDescription) -> Result<(), GraphError> {
+        self.free_retired_graphs();
+        if self.graphs_in_flight >= GRAPHS_IN_FLIGHT {
+            return Err(GraphError::QueueFull);
+        }
+        let graph = Box::new(graph::prepare(description)?);
+        match self.inbox.push(ToProcessor::Graph(graph)) {
+            Ok(()) => {
+                self.graphs_in_flight += 1;
+                Ok(())
+            }
+            Err(rtrb::PushError::Full(_)) => Err(GraphError::QueueFull),
+        }
     }
 
     pub fn next_event(&mut self) -> Option<EngineEvent> {
+        self.free_retired_graphs();
         self.events.pop().ok()
+    }
+
+    fn free_retired_graphs(&mut self) {
+        while let Ok(graph) = self.retired.pop() {
+            drop(graph);
+            self.graphs_in_flight -= 1;
+        }
     }
 }

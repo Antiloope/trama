@@ -6,8 +6,8 @@
 //! (MIDI bytes, gamepad events) into `Input`s, and turns `Notification`s back
 //! into whatever the device understands (LED colors, MIDI).
 //!
-//! - [`audio`]: opens the sound card and hands every block to a render
-//!   function (the engine);
+//! - [`audio`]: opens the sound card's output, and its input when asked,
+//!   and hands every block to a render function (the engine);
 //! - [`midi`]: finding ports, the Launchpad X, MIDI synths;
 //! - [`gamepad`]: joysticks and gamepads.
 //!

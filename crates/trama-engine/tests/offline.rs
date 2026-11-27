@@ -33,7 +33,7 @@ fn render(engine: &mut Engine, frames: u64, block: usize) -> Vec<(u64, MidiMessa
         let frames = left.min(block);
         engine
             .processor
-            .process(&mut buffer[..frames * 2], 2, Instant::now());
+            .process(&[], 0, &mut buffer[..frames * 2], 2, Instant::now());
         assert!(buffer.iter().all(|s| *s == 0.0), "output must be silent");
         while let Ok(out) = engine.midi.pop() {
             if let MidiOut::Message { at_sample, message } = out {
@@ -247,7 +247,9 @@ fn every_block_leaves_an_anchor() {
     let mut engine = engine();
     let mut buffer = [0.0_f32; 256];
     for _ in 0..3 {
-        engine.processor.process(&mut buffer, 2, Instant::now());
+        engine
+            .processor
+            .process(&[], 0, &mut buffer, 2, Instant::now());
     }
     let mut anchors = Vec::new();
     while let Ok(out) = engine.midi.pop() {

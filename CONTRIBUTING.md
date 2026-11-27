@@ -15,7 +15,7 @@
 
 | Command                                     | What it does                               |
 |---------------------------------------------|--------------------------------------------|
-| `cargo run -- doctor`                       | list the audio outputs, MIDI ports and gamepads Trama finds |
+| `cargo run -- doctor`                       | list the audio outputs and inputs, MIDI ports and gamepads Trama finds |
 | `cargo run --release -- play`               | play, with an optimized build              |
 | `cargo test --workspace`                    | every test in every crate                  |
 | `cargo fmt --all`                           | format the code                            |
@@ -33,12 +33,15 @@ versions.
 From fastest to slowest:
 
 1. **Unit tests**, next to the code they test: MIDI encoding, scales and
-   note names, Launchpad bytes, gamepad events, the clock map.
+   note names, Launchpad bytes, gamepad events, the clock map, the cushion
+   between the audio input and output, the monitoring patch of `trama
+   play`.
 2. **The core as a black box** (`crates/trama-core/tests`): inputs in,
    engine commands and notifications out.
-3. **The engine offline** (`crates/trama-engine/tests/offline.rs`): it runs
-   without a sound card, and the tests check which MIDI comes out on which
-   sample, for several block sizes.
+3. **The engine offline** (`crates/trama-engine/tests`): it runs without a
+   sound card. `offline.rs` checks which MIDI comes out on which sample,
+   for several block sizes; `graph.rs` feeds the audio graph synthetic
+   input and checks exactly what comes out.
 4. **Real-time safety** (`crates/trama-engine/tests/realtime.rs`): the
    processor runs under `assert_no_alloc`, which aborts the test if the
    audio path allocates.

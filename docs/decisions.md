@@ -58,6 +58,70 @@ port for the synth and uses a grid controller only if one is connected.
 There is one layout, the step sequencer, so it is written in code. That
 keeps it simple and shows exactly what a mapping needs to express.
 
+## The audio graph is a patchbay
+
+Audio goes through nodes connected by cables, the way gear is connected
+with a patchbay, so anything that makes or changes sound plugs into the
+same place. Each cable carries one channel: a microphone is one cable and
+a stereo synth two, and nothing assumes a channel count. Cables that meet
+at a jack are summed, as on a mixer. Loops are refused, because a graph
+without loops has an order to run its nodes in.
+
+The patch is a `GraphDescription` in `trama-protocol`, plain data that any
+layer can write and that knows nothing about who wrote it. The engine
+prepares it into a graph it can run.
+
+## Graphs are swapped, never built, on the audio thread
+
+Building a graph allocates, and the audio thread must never allocate or
+free. The controller prepares each graph on its own thread and hands it
+over; the processor swaps it in and hands the old one back to be freed.
+Graphs travel in the same queue as the commands, so everything reaches the
+processor in the order it was sent.
+
+## Level changes glide over a fixed time
+
+A gain that jumps clicks. Every change of level, mute included, glides
+over 10 ms. A fixed time rather than one block keeps the sound the same
+whatever the block size, which can be under a millisecond or near a
+hundred.
+
+## Input and output share one clock
+
+Two sound cards each have a clock of their own, and over minutes they
+drift apart: the input arrives a little faster or slower than the output
+plays. Trama does not correct that. It plays an input only through an
+output on the same clock, and the cushion between the two streams only
+absorbs which callback runs first:
+
+- on PipeWire, any input and output, because PipeWire runs every stream
+  of one program in the same cycle and adapts the devices to it;
+- elsewhere, the input of the output device itself. On macOS, an
+  aggregate device made in Audio MIDI Setup joins several devices on one
+  clock.
+
+Trama refuses an input on another clock instead of letting it click every
+few minutes. Correcting the drift means resampling, which touches only the
+sound card adapter in `trama-io`: the engine receives blocks of input
+either way.
+
+## The cushion starts at one block and grows
+
+Waiting for more input before playing it means fewer gaps and more delay.
+The cushion starts at one block, the least that works when the output
+callback runs before the input one, and grows by a block at each underrun,
+up to four, so a system that needs more gets it and one that does not
+keeps the shortest delay. Monitoring also feels the block size itself:
+`--block-size` asks for smaller blocks.
+
+## Inputs stay closed and monitoring starts muted
+
+`trama play` opens an input only when `--audio-in` names one. Opening a
+microphone shows that it is in use on Linux desktops and asks for
+permission on macOS, which no one should meet just to run the sequencer.
+When an input is open, monitoring starts muted, because a microphone next
+to speakers howls, and nothing is connected until `--connect` says so.
+
 ## cpal's native PipeWire backend on Linux
 
 PipeWire is the sound server of most current Linux desktops, and talking
