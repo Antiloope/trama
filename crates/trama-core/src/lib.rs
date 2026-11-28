@@ -222,6 +222,17 @@ impl Core {
         Some(self.engine_patch())
     }
 
+    /// What the modules show right now, as the notifications that would
+    /// bring something that has seen none of them up to date: each clock's
+    /// transport, each sequencer's steps and playhead.
+    pub fn state(&self) -> Vec<Notification> {
+        let mut out = Vec::new();
+        for slot in &self.modules {
+            slot.module.state(&mut out);
+        }
+        out
+    }
+
     /// Everything to send when Trama starts: every light, and whatever each
     /// module sends first, such as a centered pitch bend.
     pub fn start(&mut self) -> Vec<Output> {

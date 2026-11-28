@@ -77,11 +77,15 @@ impl Clock {
     }
 
     fn announce(&self, out: &mut Effects) {
-        out.notify(Notification::Transport {
+        out.notify(self.transport());
+    }
+
+    fn transport(&self) -> Notification {
+        Notification::Transport {
             clock: self.id,
             playing: self.playing,
             bpm: self.bpm,
-        });
+        }
     }
 }
 
@@ -114,6 +118,10 @@ impl Module for Clock {
             bpm: self.bpm,
             beats_per_bar: BEATS_PER_BAR,
         }
+    }
+
+    fn state(&self, out: &mut Vec<Notification>) {
+        out.push(self.transport());
     }
 
     fn shutdown(&mut self, out: &mut Effects) {

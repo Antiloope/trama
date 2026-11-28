@@ -17,6 +17,10 @@ Trama's MIDI clock. Whatever reaches the sound card's inputs, a synth's
 audio or a microphone, can play through Trama to its outputs, and the
 looper records it into loops.
 
+The `trama` server holds one project open and owns it; commands in other
+terminals are its clients, and see and change it through its API (see
+"The server").
+
 Trama does three jobs, and each job is a layer:
 
 | Layer      | Job                                                     | In one word |
@@ -476,6 +480,9 @@ come out within a fraction of a millisecond of where they belong.
   └──────────────────────────────────────────┘
 ```
 
+These are `trama play`'s threads. The server runs the core on a thread
+of its own, beside its API's (see "The server").
+
 The engine has two halves: the **controller**, on the core's thread, sends
 `EngineCommand`s and prepared patches and reads `EngineEvent`s; the
 **processor**, on the audio thread, applies the commands, swaps the
@@ -513,7 +520,7 @@ trama/
 │   ├── trama-engine/     the real-time engine (no devices, no sound card)
 │   ├── trama-core/       the brain: the patch, modules, connections, scales
 │   ├── trama-io/         adapters: sound card in and out, Launchpad X, synths, gamepads
-│   └── trama/            the program: wires everything together
+│   └── trama/            the program and its server: wires everything together
 ├── docs/                 this document and the decision log
 └── scripts/              repository checks
 ```
@@ -557,13 +564,94 @@ The main outside libraries:
 | `gilrs`             | io             | gamepads (evdev, IOKit)                       |
 | `crossbeam-channel` | io, program    | channels between normal threads               |
 | `clap`              | program        | the command line                              |
+| `axum`, `tokio`     | program        | the server's API: HTTP and a WebSocket        |
+| `serde`, `serde_json` | program      | the API's JSON                                |
+| `ureq`              | program        | commands talking to the server                |
 
 ## The program
 
-`trama doctor` lists the audio outputs and inputs, with their channels, and
-the MIDI ports and gamepads it finds. `trama play` runs the step sequencer
-and the looper, and monitors the sound card's inputs; everything it needs
-comes from its command-line options.
+`trama` without a command runs the server (below), and `trama status` is a
+client of it. `trama doctor` lists the audio outputs and inputs, with
+their channels, and the MIDI ports and gamepads it finds. `trama play` runs
+the step sequencer and the looper, and monitors the sound card's inputs;
+everything it needs comes from its command-line options, and it runs on
+its own, without the server.
+
+### The server
+
+The server holds one project open, the scratch project, and owns it:
+every client sees and changes it through the API, never directly. The
+scratch project has its main clock and nothing else, and its folder is
+`scratch/` in the user data folder (`$XDG_DATA_HOME/trama`, by default
+`~/.local/share/trama`, on Linux; `~/Library/Application Support/trama` on
+macOS), laid out like a project's. The server opens the system's default
+audio output, which is the clock, and no input. Without a sound card it
+runs all the same, and its status warns that nothing plays.
+
+```
+  ┌──────────────────────────────────────────┐
+  │ audio threads (real-time)                │  engine processor
+  └──────────▲──────────────────┬────────────┘
+             │  lock-free queues
+  ┌──────────┴──────────────────▼────────────┐
+  │ project thread                           │  core, engine controller,
+  │                                          │  sound card
+  └──────────▲──────────────────┬────────────┘
+             │ requests          │ changes, one queue per client
+  ┌──────────┴──────────────────▼────────────┐
+  │ API thread (axum on one tokio thread)    │  HTTP and WebSockets
+  └──────────▲──────────────────┬────────────┘
+             │  localhost        ▼
+         commands, browsers, any program on this computer
+```
+
+The project thread runs the core as `trama play` runs it on its main
+thread, and takes requests as messages between inputs: a status, a
+control for a module, a new client to tell about changes. The API thread
+turns each request into one of those messages and waits for the answer,
+so requests never touch the core and are handled one at a time, in order.
+
+The API, on 127.0.0.1 and ::1, port 8726 unless `--port` says otherwise:
+
+| Request              | What it does                                                    |
+|----------------------|-----------------------------------------------------------------|
+| `GET /api/status`    | the status, as JSON: what is open, the sound card, the modules, what they show, warnings |
+| `POST /api/control`  | a press, release or value for a control input of a module, as JSON, the way a connected button sends it (`{"module": "clock", "input": "play", "action": {"press": {"velocity": 1.0}}}`); 204, or 400 with the reason |
+| `GET /api/changes`   | a WebSocket of changes                                          |
+| `GET /`              | the status as text, as `trama status` prints it                 |
+
+The changes WebSocket sends the whole status first, then every change: a
+clock's transport and tempo, a sequencer's steps and playhead. Lights and
+MIDI are for devices and stay out. The project thread puts both the
+snapshot and the changes in the client's queue, so none is lost or
+repeated between them. A queue holds 4096 changes; a client that lets it
+fill is dropped, not waited for, and gets a new snapshot when it
+reconnects.
+
+Any web page open in a browser on this computer can send requests to
+localhost, so the server refuses (403) a request whose `Host` is not
+`localhost`, `127.0.0.1` or `[::1]` with its port, which stops a site that
+points its own name at this computer, and one whose `Origin` is another
+site's. A control must be JSON, which a form on another site cannot post
+without the browser asking the server first.
+
+**One server at a time.** The server holds `server.lock` in the user data
+folder locked, with its port written in it. A second server, or `trama
+play`, finds it locked and says where the running server is; commands read
+the port from it, so they find a server on any port. The system releases
+the lock when the server ends, even if it crashes, and a lock nobody holds
+means no server.
+
+Starting: take the lock, create the scratch project's folder, listen, write
+the port, then start the project thread (which opens the sound card and
+starts the core) and the API thread.
+
+Stopping (Ctrl+C): the project stops the transport, silences and darkens
+everything, gives the engine 100 ms, closes the sound card and drops every
+client's queue, so each WebSocket closes; the API then gets a second to
+close its connections, and the lock is released.
+
+### `trama play`
 
 `trama play` builds its patch in code:
 

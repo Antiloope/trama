@@ -165,6 +165,10 @@ pub(crate) trait Module {
         EngineHalf::None
     }
 
+    /// The notifications that would show it as it is now to something that
+    /// has not seen any yet.
+    fn state(&self, _out: &mut Vec<Notification>) {}
+
     /// When Trama starts, or when the module is added after that.
     fn start(&mut self, _out: &mut Effects) {}
 

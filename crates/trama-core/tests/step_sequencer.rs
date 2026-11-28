@@ -366,6 +366,39 @@ fn the_playhead_moves_a_dim_column_and_turns_notes_green() {
 }
 
 #[test]
+fn the_state_shows_the_transport_every_step_and_the_playhead() {
+    let mut core = core();
+    core.handle_input(&pad(2, 5));
+    core.handle_input(&play_button());
+    core.handle_engine_event(EngineEvent::StepStarted {
+        player: sequencer(),
+        step: 3,
+        at_sample: 18_000,
+    });
+
+    let state = core.state();
+    assert!(state.contains(&Notification::Transport {
+        clock: MAIN_CLOCK,
+        playing: true,
+        bpm: 120.0
+    }));
+    let steps: Vec<_> = state
+        .iter()
+        .filter_map(|n| match *n {
+            Notification::Step { step, note, .. } => Some((step, note.map(|n| n.pitch))),
+            _ => None,
+        })
+        .collect();
+    let mut expected: Vec<_> = (0..8).map(|step| (step, None)).collect();
+    expected[5].1 = Some(39);
+    assert_eq!(steps, expected);
+    assert!(state.contains(&Notification::Playhead {
+        module: sequencer(),
+        step: Some(3)
+    }));
+}
+
+#[test]
 fn clear_empties_every_step() {
     let mut core = core();
     core.handle_input(&pad(0, 1));

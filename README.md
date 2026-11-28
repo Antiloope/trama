@@ -13,7 +13,9 @@ records it into loops that follow the tempo, or ignore it.
 
 Inside, the sequencer and the looper are modules, connected to the devices
 the way a patchbay connects gear; [the architecture](docs/architecture.md)
-explains modules and connections.
+explains modules and connections. Trama also runs as a server with one
+project open, which commands in other terminals see and change through its
+API.
 
 ## Supported devices
 
@@ -41,8 +43,47 @@ ports, gamepads):
 cargo run -- doctor
 ```
 
-Play the step sequencer on a synth, naming its MIDI port (part of the name
-`trama doctor` shows):
+### The server
+
+Without a command, Trama runs its server in the terminal, prints its log
+there and stops on Ctrl+C:
+
+```sh
+cargo run --release
+```
+
+The server has one project open: the scratch project, which starts empty
+but for its main clock and lives in the user data folder
+(`~/.local/share/trama`, or `$XDG_DATA_HOME/trama`, on Linux;
+`~/Library/Application Support/trama` on macOS). It opens the system's
+default audio output, which is Trama's clock, and no input. Other
+terminals are its clients:
+
+```sh
+cargo run -- status
+```
+
+```
+trama 0.1.0
+  address:    http://localhost:8726
+  project:    the scratch project
+  sound card: My Card (48000 Hz, 2 channels)
+  modules:    clock
+  clock:      stopped, 120 BPM
+```
+
+The server listens on localhost only, and answers only programs on this
+computer and its own pages. Its address shows the same status in a
+browser. `--port` picks another port; commands find the server whatever
+its port. One server runs at a time, and `trama play` does not start while
+one does. [The architecture](docs/architecture.md#the-server) describes
+the API.
+
+### Playing the step sequencer
+
+`trama play` runs on its own, without the server, with a patch built in
+code. Play the step sequencer on a synth, naming its MIDI port (part of
+the name `trama doctor` shows):
 
 ```sh
 cargo run --release -- play --synth "My Synth"

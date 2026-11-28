@@ -9,13 +9,23 @@ publish.workspace = true
 
 [dependencies]
 anyhow = "1.0.105"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio", "ws"] }
 clap = { version = "4.6.10", features = ["derive"] }
 crossbeam-channel = "0.5.17"
 ctrlc = "3.5.3"
+rustix = { version = "1", features = ["fs"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tokio = { version = "1.54.1", default-features = false, features = ["rt", "net", "sync", "time", "macros"] }
 trama-core.workspace = true
 trama-engine.workspace = true
 trama-io.workspace = true
 trama-protocol.workspace = true
+ureq = { version = "3.5.2", default-features = false, features = ["json"] }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tungstenite = "0.29"

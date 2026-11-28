@@ -300,6 +300,20 @@ impl Module for StepSequencer {
         }
     }
 
+    fn state(&self, out: &mut Vec<Notification>) {
+        for step in 0..self.pattern.len() {
+            out.push(Notification::Step {
+                module: self.id,
+                step: step as u8,
+                note: self.note_at(step),
+            });
+        }
+        out.push(Notification::Playhead {
+            module: self.id,
+            step: self.playhead,
+        });
+    }
+
     fn start(&mut self, out: &mut Effects) {
         self.pitch_bend = PITCH_BEND_CENTER;
         out.midi("notes", MidiMessage::pitch_bend(self.settings.channel, 0.0));
