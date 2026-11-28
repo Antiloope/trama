@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! `trama play`: the step sequencer, and monitoring of the sound card's
-//! inputs, as a patch built in code (see [`patch`]).
+//! `trama play`: the step sequencer and loopers sharing a grid, and
+//! monitoring of the sound card's inputs, as a patch built in code (see
+//! [`patch`]).
 //!
 //! Threads:
 //!
@@ -19,7 +20,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use clap::Args;
 use crossbeam_channel::{RecvTimeoutError, Sender};
-use patch::{Monitoring, PADS, SYNTH};
+use patch::{Layout, Monitoring, PADS, SYNTH};
 use trama_core::modules::step_sequencer::StepSequencerSettings;
 use trama_core::music::{Scale, note_name, parse_note};
 use trama_core::{Core, Output};
@@ -87,6 +88,35 @@ pub struct PlayArgs {
     /// stays muted.
     #[arg(long, value_name = "DB", allow_negative_numbers = true, value_parser = parse_decibels)]
     monitor: Option<f32>,
+
+    /// Rows of the grid, from the top, that are clips of the looper, one
+    /// scene per row: 0 to 7. The sequencer has the rows below.
+    #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u8).range(0..=7))]
+    looper_rows: u8,
+
+    /// Columns of the looper, from the right, whose loops are free: they
+    /// last as long as they were recorded and ignore the tempo. The other
+    /// columns follow the clock.
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=8))]
+    free_columns: u8,
+
+    /// A channel of every looper track: it records input channel IN and
+    /// plays to output channel OUT, counting from 1. Once for mono tracks,
+    /// twice for stereo: `--loop 1:1 --loop 2:2`. Without it, the looper
+    /// records silence.
+    #[arg(long = "loop", value_name = "IN:OUT", value_parser = parse_cable)]
+    loop_cables: Vec<(u16, u16)>,
+
+    /// Milliseconds to add to the sound card's round trip, which Trama
+    /// measures and records loops that much later, so they line up with
+    /// what was heard. Negative if loops sound late, positive if early.
+    #[arg(
+        long,
+        value_name = "MS",
+        default_value_t = 0.0,
+        allow_negative_numbers = true
+    )]
+    latency_trim: f64,
 
     /// Frames per audio block. Smaller blocks shorten the delay between
     /// input and output and cost more CPU. Defaults to the system's choice.
@@ -168,22 +198,33 @@ pub fn run(args: PlayArgs) -> anyhow::Result<()> {
         None if !args.connect.is_empty() => {
             anyhow::bail!("--connect needs an audio input: choose one with --audio-in")
         }
+        None if !args.loop_cables.is_empty() => {
+            anyhow::bail!("--loop needs an audio input: choose one with --audio-in")
+        }
         None => None,
         Some("default") => Some(InputDevice::find(None, &output)?),
         Some(pattern) => Some(InputDevice::find(Some(pattern), &output)?),
     };
     let input_channels = input.as_ref().map_or(0, InputDevice::channels);
-    for &(from, to) in &args.connect {
+    if args.loop_cables.len() > 2 {
+        anyhow::bail!("--loop: a looper track has one or two channels");
+    }
+    let cables = args.connect.iter().map(|c| ("--connect", c));
+    for (option, &(from, to)) in cables.chain(args.loop_cables.iter().map(|c| ("--loop", c))) {
         if from > input_channels {
-            anyhow::bail!("--connect {from}:{to}: the input has {input_channels} channels");
+            anyhow::bail!("{option} {from}:{to}: the input has {input_channels} channels");
         }
         if to > output.channels() {
             anyhow::bail!(
-                "--connect {from}:{to}: the output has {} channels",
+                "{option} {from}:{to}: the output has {} channels",
                 output.channels()
             );
         }
     }
+    let layout = Layout {
+        looper_rows: args.looper_rows,
+        free_columns: args.free_columns,
+    };
     let sample_rate = output.sample_rate();
     let Engine {
         mut controller,
@@ -201,7 +242,11 @@ pub fn run(args: PlayArgs) -> anyhow::Result<()> {
             channel,
             ..StepSequencerSettings::default()
         },
+        layout,
     )?;
+    let loop_channels = args.loop_cables.len().max(1) as u8;
+    patch::add_loopers(&mut core, layout, loop_channels)?;
+    patch::connect_loop_audio(&mut core, layout, &args.loop_cables)?;
     let monitoring = Monitoring::add(&mut core, &args.connect, args.monitor)?;
 
     let (core_tx, core_rx) = crossbeam_channel::unbounded();
@@ -268,7 +313,7 @@ pub fn run(args: PlayArgs) -> anyhow::Result<()> {
             match (connected, chosen) {
                 (Ok(launchpad), _) => {
                     println!("  pads:     {}", launchpad.port());
-                    patch::connect_pads(&mut core, PADS)?;
+                    patch::connect_pads(&mut core, PADS, layout)?;
                     Some(launchpad)
                 }
                 (Err(error), None) => {
@@ -324,7 +369,10 @@ pub fn run(args: PlayArgs) -> anyhow::Result<()> {
         args.rate,
         args.bpm
     );
-    print_controls(launchpad.is_some(), gamepads.is_some());
+    if layout.looper_rows > 0 {
+        println!("  looper:   {}", describe_looper(layout, &args.loop_cables));
+    }
+    print_controls(launchpad.is_some(), gamepads.is_some(), layout);
 
     let verbose = args.verbose;
     let mut run = Run {
@@ -336,6 +384,11 @@ pub fn run(args: PlayArgs) -> anyhow::Result<()> {
     let start = run.core.start();
     run.dispatch(start);
     let mut input_report = InputReport::new();
+    let mut latency = Latency {
+        sample_rate: f64::from(sample_rate),
+        trim: args.latency_trim / 1000.0,
+        sent: None,
+    };
     loop {
         match core_rx.recv_timeout(Duration::from_millis(1)) {
             Ok(CoreMessage::Input(input)) => run.input(input),
@@ -358,6 +411,7 @@ pub fn run(args: PlayArgs) -> anyhow::Result<()> {
         }
         if let Some(stats) = audio.input_stats() {
             input_report.check(stats);
+            latency.update(stats.round_trip, &mut run.controller);
         }
     }
 
@@ -438,6 +492,62 @@ fn send(engine: &mut EngineController, command: EngineCommand) {
     }
 }
 
+/// Tells the engine the sound card's round trip, plus the trim, whenever
+/// it moves by a millisecond or more, so loops line up with what was
+/// heard.
+struct Latency {
+    sample_rate: f64,
+    /// Seconds.
+    trim: f64,
+    /// Frames.
+    sent: Option<u32>,
+}
+
+impl Latency {
+    fn update(&mut self, round_trip: Option<Duration>, engine: &mut EngineController) {
+        let Some(round_trip) = round_trip else {
+            return;
+        };
+        let seconds = (round_trip.as_secs_f64() + self.trim).max(0.0);
+        let frames = (seconds * self.sample_rate).round() as u32;
+        let millisecond = (self.sample_rate / 1000.0) as u32;
+        if self
+            .sent
+            .is_some_and(|sent| sent.abs_diff(frames) < millisecond)
+        {
+            return;
+        }
+        if self.sent.is_none() {
+            println!(
+                "  latency:  {:.1} ms from output to input; loops are recorded that much later",
+                seconds * 1000.0
+            );
+        }
+        self.sent = Some(frames);
+        send(engine, EngineCommand::SetLatency { frames });
+    }
+}
+
+/// What the looper part of the grid is, in a line.
+fn describe_looper(layout: Layout, cables: &[(u16, u16)]) -> String {
+    let free = layout.free_columns.min(8);
+    let tracks = match free {
+        0 => "8 tracks on the clock".to_string(),
+        8 => "8 free tracks".to_string(),
+        free => format!("{} tracks on the clock, {free} free", 8 - free),
+    };
+    let audio = if cables.is_empty() {
+        "records nothing (see --loop)".to_string()
+    } else {
+        let cables: Vec<String> = cables
+            .iter()
+            .map(|(from, to)| format!("{from}→{to}"))
+            .collect();
+        format!("records and plays {}", cables.join(" "))
+    };
+    format!("{} scenes, {tracks}; {audio}", layout.looper_rows)
+}
+
 /// Tells the musician, at most once a second, when the input runs short or
 /// over, and once if it has only ever been silent.
 struct InputReport {
@@ -483,15 +593,31 @@ impl InputReport {
     }
 }
 
-fn print_controls(pads: bool, gamepad: bool) {
+fn print_controls(pads: bool, gamepad: bool, layout: Layout) {
     println!();
     if pads {
+        let sequencer = layout.sequencer_rows();
+        let looper = layout.looper_rows;
         println!("Launchpad X:");
+        if looper > 0 {
+            println!(
+                "  top {looper} rows       clips: a track per column, a scene per row; press an empty \
+                 one to record, again to play, again to stop"
+            );
+            println!("  beside them (>)  play a scene");
+        }
         println!(
-            "  pads             a step per column, a scale degree per row (root at the bottom)"
+            "  bottom {sequencer} rows    a step per column, a scale degree per row (root at the \
+             bottom)"
         );
-        println!("  top right (>)    play / stop");
-        println!("  bottom right (>) clear the pattern");
+        let mut functions = vec!["play / stop"];
+        if looper > 0 {
+            functions.push("hold and press a clip to delete it");
+        }
+        functions.push("clear the pattern");
+        for (row, function) in functions.iter().enumerate().take(usize::from(sequencer)) {
+            println!("  > on row {}       {function}", row + 1);
+        }
         println!("  up / down        octave");
         println!("  left / right     tempo -5 / +5 BPM");
     }

@@ -13,9 +13,11 @@
 //!
 //! The author of a description chooses each node's [`NodeId`]. A node with
 //! the same id in the next description is the same node, so a gain keeps
-//! the level it was at instead of jumping.
+//! the level it was at instead of jumping, and a looper its loops.
 
 use std::fmt;
+
+use crate::name::ModuleId;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeId(pub u32);
@@ -47,6 +49,23 @@ pub enum NodeKind {
     /// Multiplies what it receives by `gain`, a linear factor from 0 to
     /// [`MAX_GAIN`]. Muted, it sends silence and remembers `gain`.
     Gain { gain: f32, muted: bool },
+    /// Records what reaches it into loops and plays them: `tracks` tracks
+    /// (1 to [`MAX_TRACKS`](crate::MAX_TRACKS)) of `scenes` clips (1 to
+    /// [`MAX_SCENES`](crate::MAX_SCENES)), each of `channels` channels (1
+    /// or 2). Its jacks, inputs and outputs alike, go track by track and
+    /// channel by channel: jack 0 is the first channel of track 0.
+    ///
+    /// Its clips share `seconds` seconds of memory. With a `clock`, they
+    /// last whole bars of that clock, follow its tempo and start on its
+    /// bars; without one, they last as long as they were recorded and
+    /// start at once.
+    Looper {
+        tracks: u8,
+        scenes: u8,
+        channels: u8,
+        seconds: u32,
+        clock: Option<ModuleId>,
+    },
 }
 
 impl NodeKind {
@@ -55,6 +74,9 @@ impl NodeKind {
         match self {
             NodeKind::AudioInput { .. } => 0,
             NodeKind::AudioOutput { .. } | NodeKind::Gain { .. } => 1,
+            NodeKind::Looper {
+                tracks, channels, ..
+            } => u16::from(tracks) * u16::from(channels),
         }
     }
 
@@ -63,6 +85,9 @@ impl NodeKind {
         match self {
             NodeKind::AudioOutput { .. } => 0,
             NodeKind::AudioInput { .. } | NodeKind::Gain { .. } => 1,
+            NodeKind::Looper {
+                tracks, channels, ..
+            } => u16::from(tracks) * u16::from(channels),
         }
     }
 }
@@ -133,6 +158,14 @@ mod tests {
         assert_eq!((input.inputs(), input.outputs()), (0, 1));
         assert_eq!((output.inputs(), output.outputs()), (1, 0));
         assert_eq!((gain.inputs(), gain.outputs()), (1, 1));
+        let looper = NodeKind::Looper {
+            tracks: 8,
+            scenes: 4,
+            channels: 2,
+            seconds: 60,
+            clock: None,
+        };
+        assert_eq!((looper.inputs(), looper.outputs()), (16, 16));
     }
 
     #[test]

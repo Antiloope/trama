@@ -34,8 +34,9 @@ use module::{Effect, Effects, EngineHalf, Module};
 pub use modules::ModuleSettings;
 use modules::clock::Clock;
 use modules::gain::Gain;
+use modules::looper::Looper;
 use modules::step_sequencer::StepSequencer;
-pub use patch::{Connection, Curve, PatchError, Point, Transform, Zone};
+pub use patch::{Connection, Curve, PatchError, Point, RowButtons, Transform, Zone};
 use trama_protocol::{
     Action, ClockDescription, Command, Control, DeviceId, EngineCommand, EngineEvent, EnginePatch,
     Input, Jack, Light, ModuleId, NodeId, NodeKind, Notification, StepPlayerDescription,
@@ -124,6 +125,9 @@ impl Core {
                 Box::new(StepSequencer::new(id, settings).map_err(invalid)?)
             }
             ModuleSettings::Gain(settings) => Box::new(Gain::new(node, settings).map_err(invalid)?),
+            ModuleSettings::Looper(settings) => {
+                Box::new(Looper::new(node, settings).map_err(invalid)?)
+            }
         };
         self.next_node += 1;
         let mut out = Vec::new();
@@ -272,6 +276,12 @@ impl Core {
                         None => continue,
                     }
                 }
+                Point::RowButtons { device, rows } if device == input.device => {
+                    match rows.cell(input.control) {
+                        Some(cell) => Some(cell),
+                        None => continue,
+                    }
+                }
                 _ => continue,
             };
             let action = match (connection.transform, input.action) {
@@ -317,6 +327,12 @@ impl Core {
         let mut out = Vec::new();
         let concerned: Vec<ModuleId> = match event {
             EngineEvent::StepStarted { player, .. } => vec![player],
+            EngineEvent::Track { node, .. } | EngineEvent::Clip { node, .. } => self
+                .modules
+                .iter()
+                .filter(|s| s.node == node)
+                .map(|s| s.id)
+                .collect(),
             EngineEvent::Started { clock } | EngineEvent::Stopped { clock } => self
                 .modules
                 .iter()
@@ -414,6 +430,15 @@ impl Core {
                             .cell(pad)
                             .map_or(Light::OFF, |cell| slot.module.light(port, Some(cell)));
                         (device, pad, light)
+                    })
+                    .collect(),
+                Point::RowButtons { device, rows } => rows
+                    .buttons()
+                    .map(|button| {
+                        let light = rows
+                            .cell(button)
+                            .map_or(Light::OFF, |cell| slot.module.light(port, Some(cell)));
+                        (device, button, light)
                     })
                     .collect(),
                 _ => continue,
@@ -570,15 +595,23 @@ impl Core {
                 return Err(PatchError::UnknownDevice(device));
             }
         }
-        if let Point::Pads { zone, .. } = point {
-            if zone.rows == 0 || zone.columns == 0 {
+        match point {
+            Point::Pads { zone, .. } if zone.rows == 0 || zone.columns == 0 => {
                 return Err(PatchError::InvalidZone);
             }
+            Point::RowButtons { rows, .. } if rows.count == 0 => {
+                return Err(PatchError::InvalidZone);
+            }
+            _ => {}
         }
         let shape = |point: Point| match point {
             Point::Pads { zone, .. } => Shape::Grid {
                 rows: zone.rows,
                 columns: zone.columns,
+            },
+            Point::RowButtons { rows, .. } => Shape::Grid {
+                rows: rows.count,
+                columns: 1,
             },
             _ => Shape::One,
         };
@@ -590,12 +623,14 @@ impl Core {
             (Point::Module { module, port }, direction) => {
                 End::Port(self.port(module, port, direction)?)
             }
-            (Point::Control { .. } | Point::Pads { .. }, Direction::Output) => {
-                End::Controls(shape(point))
-            }
-            (Point::Control { .. } | Point::Pads { .. }, Direction::Input) => {
-                End::Lit(shape(point))
-            }
+            (
+                Point::Control { .. } | Point::Pads { .. } | Point::RowButtons { .. },
+                Direction::Output,
+            ) => End::Controls(shape(point)),
+            (
+                Point::Control { .. } | Point::Pads { .. } | Point::RowButtons { .. },
+                Direction::Input,
+            ) => End::Lit(shape(point)),
             (Point::Midi(_), Direction::Input) => End::Midi,
             (Point::AudioIn(_), Direction::Output) | (Point::AudioOut(_), Direction::Input) => {
                 End::Audio
@@ -666,9 +701,10 @@ impl Core {
             };
             match slot.module.engine_half() {
                 EngineHalf::None => {}
-                EngineHalf::Clock { bpm } => patch.clocks.push(ClockDescription {
+                EngineHalf::Clock { bpm, beats_per_bar } => patch.clocks.push(ClockDescription {
                     id: slot.id,
                     bpm,
+                    beats_per_bar,
                     midi_to: midi_to(PortKind::Clock),
                 }),
                 EngineHalf::StepPlayer {
@@ -687,6 +723,25 @@ impl Core {
                 }),
                 EngineHalf::Node(kind) => {
                     patch.graph.add(slot.node, kind);
+                }
+                EngineHalf::Looper {
+                    tracks,
+                    scenes,
+                    channels,
+                    seconds,
+                    synced,
+                } => {
+                    let clock = synced.then(|| self.clock_of(slot.id).unwrap_or(MAIN_CLOCK));
+                    patch.graph.add(
+                        slot.node,
+                        NodeKind::Looper {
+                            tracks,
+                            scenes,
+                            channels,
+                            seconds,
+                            clock,
+                        },
+                    );
                 }
             }
         }

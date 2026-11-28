@@ -29,13 +29,17 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rtrb::{Consumer, Producer, RingBuffer};
 
 use super::drift::DriftControl;
 
 pub(crate) const MAX_CUSHION_BLOCKS: u32 = 4;
+
+/// How much of each new measure of the round trip goes into its estimate,
+/// which then follows changes over a second or so.
+const ROUND_TRIP_SMOOTHING: f64 = 0.02;
 
 /// What the two ends of the cushion share, and what it has been through,
 /// readable from any thread.
@@ -55,6 +59,13 @@ pub(crate) struct Counters {
     /// The bits of an `f64`: the correction the reader asks of the
     /// resampler, a factor near 1.
     correction: AtomicU64,
+    /// The bits of an `f64`: how long the input's last block took from
+    /// the device to the input callback, and through the resampler, in
+    /// seconds.
+    input_delay: AtomicU64,
+    /// The bits of an `f64`: the estimate of the round trip, in seconds.
+    /// NaN until the output has read input.
+    round_trip: AtomicU64,
 }
 
 /// How the input has fared so far.
@@ -71,6 +82,11 @@ pub struct InputStats {
     /// silence. A macOS terminal without microphone access only ever gets
     /// silence.
     pub heard_sound: bool,
+    /// How long after the output computes a block a sound played along
+    /// with it reaches the render function: the time to be heard, plus the
+    /// time back through the input and the cushion. An estimate from what
+    /// the system reports, smoothed; `None` before the first block.
+    pub round_trip: Option<Duration>,
 }
 
 impl Counters {
@@ -83,6 +99,8 @@ impl Counters {
             heard_sound: AtomicBool::new(false),
             input_lag: AtomicU64::new(f64::NAN.to_bits()),
             correction: AtomicU64::new(1.0_f64.to_bits()),
+            input_delay: AtomicU64::new(0.0_f64.to_bits()),
+            round_trip: AtomicU64::new(f64::NAN.to_bits()),
         }
     }
 
@@ -92,6 +110,9 @@ impl Counters {
             overruns: self.overruns.load(Ordering::Relaxed),
             cushion_blocks: self.cushion_blocks.load(Ordering::Relaxed),
             heard_sound: self.heard_sound.load(Ordering::Relaxed),
+            round_trip: Some(f64::from_bits(self.round_trip.load(Ordering::Relaxed)))
+                .filter(|seconds| seconds.is_finite())
+                .map(|seconds| Duration::from_secs_f64(seconds.max(0.0))),
         }
     }
 }
@@ -139,6 +160,7 @@ fn build(
             channels,
             filling: true,
             cushion_blocks: 1,
+            round_trip: None,
             counters: counters.clone(),
             steering: steered_at.map(|rate| Steering {
                 clock: StreamClock::new(start, rate),
@@ -192,6 +214,14 @@ impl CushionWriter {
         f64::from_bits(self.counters.correction.load(Ordering::Relaxed))
     }
 
+    /// How long the block being written took to get here from the
+    /// device, in seconds.
+    pub(crate) fn set_input_delay(&self, seconds: f64) {
+        self.counters
+            .input_delay
+            .store(seconds.to_bits(), Ordering::Relaxed);
+    }
+
     /// Queues the interleaved `samples` of one input block, captured by
     /// `at`. Whole frames only: what does not fit is dropped and counted.
     pub(crate) fn write(&mut self, samples: &[f32], at: Instant) {
@@ -240,6 +270,8 @@ pub(crate) struct CushionReader {
     /// Waiting for the cushion to fill before reading.
     filling: bool,
     cushion_blocks: u32,
+    /// The estimate of the round trip, in seconds.
+    round_trip: Option<f64>,
     counters: Arc<Counters>,
     /// Present when the input runs on a clock of its own.
     steering: Option<Steering>,
@@ -267,9 +299,27 @@ impl CushionReader {
         self.channels
     }
 
-    #[cfg(test)]
     pub(crate) fn queued_frames(&self) -> usize {
         self.ring.slots() / self.channels
+    }
+
+    /// Before a read: adds to the estimate of the round trip the output's
+    /// latency, `output_delay` seconds, what waits in the cushion, at
+    /// `sample_rate`, and the input's latency.
+    pub(crate) fn note_round_trip(&mut self, output_delay: f64, sample_rate: f64) {
+        let input_delay = f64::from_bits(self.counters.input_delay.load(Ordering::Relaxed));
+        let measured = output_delay + input_delay + self.queued_frames() as f64 / sample_rate;
+        if !measured.is_finite() {
+            return;
+        }
+        let estimate = match self.round_trip {
+            Some(estimate) => estimate + (measured - estimate) * ROUND_TRIP_SMOOTHING,
+            None => measured,
+        };
+        self.round_trip = Some(estimate);
+        self.counters
+            .round_trip
+            .store(estimate.to_bits(), Ordering::Relaxed);
     }
 
     /// Fills `out`, interleaved, with the oldest input, or with silence
@@ -412,6 +462,23 @@ mod tests {
 
     fn write(writer: &mut CushionWriter, samples: &[f32]) {
         writer.write(samples, Instant::now());
+    }
+
+    #[test]
+    fn the_round_trip_adds_both_latencies_and_the_cushion() {
+        let (mut writer, mut reader, counters) = cushion(1, 1024);
+        assert_eq!(counters.stats().round_trip, None);
+        writer.set_input_delay(0.001);
+        write(&mut writer, &frames(0, 480));
+        reader.note_round_trip(0.004, 48_000.0);
+        let round_trip = counters.stats().round_trip.unwrap().as_secs_f64();
+        assert!((round_trip - 0.015).abs() < 1e-9, "{round_trip}");
+        // With the cushion empty a measure is 5 ms, and the estimate moves
+        // a fiftieth of the way there.
+        read(&mut reader, 480);
+        reader.note_round_trip(0.004, 48_000.0);
+        let smoothed = counters.stats().round_trip.unwrap().as_secs_f64();
+        assert!((smoothed - 0.0148).abs() < 1e-9, "{smoothed}");
     }
 
     #[test]

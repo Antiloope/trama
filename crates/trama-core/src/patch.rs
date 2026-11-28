@@ -5,9 +5,10 @@
 //! A connection goes from a [`Point`] that produces something to one that
 //! receives it:
 //!
-//! - a control of a device, or a zone of a grid's pads, to a control input
-//!   of a module;
-//! - a light output of a module to a control, or a zone of pads;
+//! - a control of a device, a zone of a grid's pads, or buttons beside its
+//!   rows, to a control input of a module;
+//! - a light output of a module to a control, a zone of pads, or buttons
+//!   beside rows;
 //! - a notes or clock output of a module to a device's MIDI input;
 //! - audio from a channel of the sound card's input, or a module's audio
 //!   output, to a module's audio input or a channel of the sound card's
@@ -29,6 +30,10 @@ pub enum Point {
     /// A rectangle of a grid's pads, which meets an input or output shaped
     /// like a grid with its bottom-left pad on cell (0, 0).
     Pads { device: DeviceId, zone: Zone },
+    /// Buttons beside consecutive rows of a grid, which meet an input or
+    /// output shaped like a grid of one column, the lowest button on cell
+    /// (0, 0).
+    RowButtons { device: DeviceId, rows: RowButtons },
     /// A device's MIDI input, where notes and MIDI clock go.
     Midi(DeviceId),
     /// A channel of the sound card's input, counting from 0.
@@ -53,9 +58,10 @@ impl Point {
 
     pub(crate) fn device(&self) -> Option<DeviceId> {
         match *self {
-            Point::Control { device, .. } | Point::Pads { device, .. } | Point::Midi(device) => {
-                Some(device)
-            }
+            Point::Control { device, .. }
+            | Point::Pads { device, .. }
+            | Point::RowButtons { device, .. }
+            | Point::Midi(device) => Some(device),
             _ => None,
         }
     }
@@ -72,6 +78,7 @@ impl Point {
         match *self {
             Point::Control { control, .. } => vec![control],
             Point::Pads { zone, .. } => zone.pads().collect(),
+            Point::RowButtons { rows, .. } => rows.buttons().collect(),
             _ => Vec::new(),
         }
     }
@@ -86,6 +93,9 @@ impl fmt::Display for Point {
                 "{device}.pads({}, {})+{}x{}",
                 zone.row, zone.column, zone.rows, zone.columns
             ),
+            Point::RowButtons { device, rows } => {
+                write!(f, "{device}.row_buttons({})+{}", rows.row, rows.count)
+            }
             Point::Midi(device) => write!(f, "{device}.midi"),
             Point::AudioIn(channel) => write!(f, "audio-in.{}", channel + 1),
             Point::AudioOut(channel) => write!(f, "audio-out.{}", channel + 1),
@@ -138,6 +148,34 @@ impl Zone {
                     row: zone.row.checked_add(row)?,
                     column: zone.column.checked_add(column)?,
                 })
+            })
+        })
+    }
+}
+
+/// The buttons beside `count` rows of a grid, from row `row` up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowButtons {
+    pub row: u8,
+    pub count: u8,
+}
+
+impl RowButtons {
+    /// The cell `control` is, if it is one of these buttons.
+    pub fn cell(&self, control: Control) -> Option<Cell> {
+        let Control::RowButton { row } = control else {
+            return None;
+        };
+        let row = row.checked_sub(self.row).filter(|r| *r < self.count)?;
+        Some(Cell { row, column: 0 })
+    }
+
+    /// Every button, from the bottom.
+    pub fn buttons(&self) -> impl Iterator<Item = Control> + use<> {
+        let first = self.row;
+        (0..self.count).filter_map(move |row| {
+            Some(Control::RowButton {
+                row: first.checked_add(row)?,
             })
         })
     }
@@ -267,7 +305,7 @@ pub enum PatchError {
     },
     /// The audio would go round in a circle.
     Loop,
-    /// An empty zone of pads.
+    /// An empty zone of pads, or no row buttons.
     InvalidZone,
     /// A transform on a connection that does not carry controls, or one
     /// whose ranges do not work.
@@ -300,7 +338,7 @@ impl fmt::Display for PatchError {
                 ControlName(*control)
             ),
             PatchError::Loop => f.write_str("the audio would go round in a circle"),
-            PatchError::InvalidZone => f.write_str("a zone needs at least one pad"),
+            PatchError::InvalidZone => f.write_str("a zone needs at least one pad or button"),
             PatchError::InvalidTransform => f.write_str(
                 "only connections that carry controls take a transform, and its ranges must work",
             ),
@@ -331,6 +369,19 @@ mod tests {
         assert_eq!(zone.cell(Control::RowButton { row: 4 }), None);
         assert_eq!(zone.pads().count(), 6);
         assert_eq!(zone.pads().next(), Some(Control::Pad { row: 4, column: 2 }));
+    }
+
+    #[test]
+    fn row_buttons_find_their_cells() {
+        let rows = RowButtons { row: 4, count: 4 };
+        assert_eq!(
+            rows.cell(Control::RowButton { row: 6 }),
+            Some(Cell { row: 2, column: 0 })
+        );
+        assert_eq!(rows.cell(Control::RowButton { row: 3 }), None);
+        assert_eq!(rows.cell(Control::Pad { row: 6, column: 0 }), None);
+        assert_eq!(rows.buttons().count(), 4);
+        assert_eq!(rows.buttons().last(), Some(Control::RowButton { row: 7 }));
     }
 
     #[test]

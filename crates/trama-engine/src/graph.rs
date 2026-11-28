@@ -4,15 +4,19 @@
 //!
 //! [`prepare`] checks a [`GraphDescription`] and works out, off the audio
 //! thread, everything running it needs: the order of the nodes, a buffer for
-//! every output jack and the buffers every input jack sums. Running a
-//! prepared graph never allocates, locks or blocks.
+//! every output jack, the buffers every input jack sums, and the memory of
+//! each looper. Running a prepared graph never allocates, locks or blocks.
 
 use std::collections::VecDeque;
 use std::ops::Range;
 
-use trama_protocol::{GraphDescription, MAX_GAIN, NodeId, NodeKind};
+use trama_protocol::{
+    GraphDescription, MAX_GAIN, MAX_SCENES, MAX_TRACKS, ModuleId, NodeId, NodeKind, TrackAction,
+};
 
 use crate::EngineError;
+use crate::looper::{Looper, LooperShape, Moment};
+use crate::patch::Outbox;
 
 /// The most frames a graph runs at once. Longer blocks run in pieces.
 pub(crate) const MAX_FRAMES: usize = 1024;
@@ -40,12 +44,14 @@ struct PreparedNode {
     inputs: Range<usize>,
     /// The number of this node's first output buffer.
     first_output: usize,
+    outputs: usize,
 }
 
 enum Process {
     AudioInput { channel: usize },
     AudioOutput { channel: usize },
     Gain(GainState),
+    Looper(Box<Looper>),
 }
 
 struct GainState {
@@ -71,7 +77,7 @@ impl GainState {
 
 /// A level that glides to a new target in a fixed number of frames, so a
 /// change does not click.
-struct Ramp {
+pub(crate) struct Ramp {
     current: f32,
     target: f32,
     step: f32,
@@ -79,7 +85,7 @@ struct Ramp {
 }
 
 impl Ramp {
-    fn at(level: f32) -> Ramp {
+    pub(crate) fn at(level: f32) -> Ramp {
         Ramp {
             current: level,
             target: level,
@@ -88,7 +94,7 @@ impl Ramp {
         }
     }
 
-    fn glide_to(&mut self, target: f32, frames: u32) {
+    pub(crate) fn glide_to(&mut self, target: f32, frames: u32) {
         self.target = target;
         if target == self.current || frames == 0 {
             self.current = target;
@@ -99,7 +105,12 @@ impl Ramp {
         }
     }
 
-    fn next(&mut self) -> f32 {
+    /// Whether it rests at 0.
+    pub(crate) fn is_silent(&self) -> bool {
+        self.frames_left == 0 && self.current == 0.0
+    }
+
+    pub(crate) fn next(&mut self) -> f32 {
         if self.frames_left > 0 {
             self.frames_left -= 1;
             self.current = if self.frames_left == 0 {
@@ -161,16 +172,85 @@ impl PreparedGraph {
 
     /// Before this graph replaces `old`: every gain that `old` also has
     /// starts where it was in `old` and glides to its own level over `ramp`
-    /// frames, so swapping graphs does not click.
-    pub(crate) fn continue_from(&mut self, old: &PreparedGraph, ramp: u32) {
+    /// frames, so swapping graphs does not click; every looper that `old`
+    /// also has takes over its memory, loops and all.
+    pub(crate) fn continue_from(&mut self, old: &mut PreparedGraph, ramp: u32) {
         for node in &mut self.nodes {
-            if let Process::Gain(state) = &mut node.process {
-                if let Some(previous) = old.gain(node.id) {
-                    state.ramp = Ramp::at(previous.ramp.current);
-                    let level = state.level();
-                    state.ramp.glide_to(level, ramp);
+            match &mut node.process {
+                Process::Gain(state) => {
+                    if let Some(previous) = old.gain(node.id) {
+                        state.ramp = Ramp::at(previous.ramp.current);
+                        let level = state.level();
+                        state.ramp.glide_to(level, ramp);
+                    }
+                }
+                Process::Looper(looper) => {
+                    if let Some(previous) = old.looper_mut(node.id) {
+                        looper.continue_from(previous);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// What track `track` of the looper `id` does next. Ignored if there is
+    /// no such looper or track.
+    pub(crate) fn queue_track(
+        &mut self,
+        id: NodeId,
+        track: u8,
+        action: Option<TrackAction>,
+        at: u64,
+        latency: u32,
+        out: &mut Outbox,
+    ) {
+        if let Some(looper) = self.looper_mut(id) {
+            looper.queue(track, action, at, latency, out);
+        }
+    }
+
+    pub(crate) fn delete_clip(
+        &mut self,
+        id: NodeId,
+        track: u8,
+        scene: u8,
+        at: u64,
+        out: &mut Outbox,
+    ) {
+        if let Some(looper) = self.looper_mut(id) {
+            looper.delete(track, scene, at, out);
+        }
+    }
+
+    /// The clock at `clock` among the patch's clocks stopped at sample
+    /// `at`: so do the loopers that follow it.
+    pub(crate) fn clock_stopped(&mut self, clock: usize, at: u64, out: &mut Outbox) {
+        for node in &mut self.nodes {
+            if let Process::Looper(looper) = &mut node.process {
+                if looper.clock() == Some(clock) {
+                    looper.halt(at, out);
                 }
             }
+        }
+    }
+
+    /// The loopers it runs, with their shapes.
+    pub(crate) fn loopers(&self) -> Vec<(NodeId, LooperShape)> {
+        self.nodes
+            .iter()
+            .filter_map(|node| match &node.process {
+                Process::Looper(looper) => Some((node.id, looper.shape())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn looper_mut(&mut self, id: NodeId) -> Option<&mut Looper> {
+        let found = self.by_id.binary_search_by_key(&id, |&(id, _)| id).ok()?;
+        match &mut self.nodes[self.by_id[found].1].process {
+            Process::Looper(looper) => Some(looper),
+            _ => None,
         }
     }
 
@@ -192,7 +272,7 @@ impl PreparedGraph {
 
     /// Runs every node over one piece of a block, adding what reaches the
     /// output nodes to `frames.output`.
-    pub(crate) fn run(&mut self, frames: Frames<'_>) {
+    pub(crate) fn run(&mut self, frames: Frames<'_>, moment: &Moment<'_>, out: &mut Outbox) {
         let Frames {
             input,
             input_channels,
@@ -232,6 +312,11 @@ impl PreparedGraph {
                     for (out, sample) in out.iter_mut().zip(received) {
                         *out = sample * ramp.next();
                     }
+                }
+                Process::Looper(looper) => {
+                    let jacks = node.outputs * MAX_FRAMES;
+                    let outputs = &mut buffers[node.first_output * MAX_FRAMES..][..jacks];
+                    looper.run(&gathered[..], outputs, len, moment, out);
                 }
                 &mut Process::AudioOutput { channel } if channel < output_channels => {
                     let start = offset * output_channels + channel;
@@ -275,7 +360,15 @@ fn read_channel(input: &[f32], channels: usize, offset: usize, channel: usize, o
 }
 
 /// Checks `description` and turns it into a graph the audio thread can run.
-pub(crate) fn prepare(description: &GraphDescription) -> Result<PreparedGraph, EngineError> {
+/// `clocks` are the patch's clocks, which loopers follow. A looper in
+/// `running`, the loopers of the patch this one is to replace, is left
+/// without memory: the swap moves that looper's in.
+pub(crate) fn prepare(
+    description: &GraphDescription,
+    clocks: &[ModuleId],
+    sample_rate: u32,
+    running: &[(NodeId, LooperShape)],
+) -> Result<PreparedGraph, EngineError> {
     let nodes = &description.nodes;
 
     let mut by_id: Vec<(NodeId, usize)> = nodes
@@ -295,8 +388,34 @@ pub(crate) fn prepare(description: &GraphDescription) -> Result<PreparedGraph, E
     };
 
     for node in nodes {
-        if matches!(node.kind, NodeKind::Gain { gain, .. } if !gain.is_finite()) {
-            return Err(EngineError::InvalidGain(node.id));
+        match node.kind {
+            NodeKind::Gain { gain, .. } if !gain.is_finite() => {
+                return Err(EngineError::InvalidGain(node.id));
+            }
+            NodeKind::Looper {
+                tracks,
+                scenes,
+                channels,
+                seconds,
+                clock,
+            } => {
+                let fits = (1..=MAX_TRACKS).contains(&usize::from(tracks))
+                    && (1..=MAX_SCENES).contains(&usize::from(scenes))
+                    && (1..=2).contains(&channels)
+                    && seconds > 0;
+                if !fits {
+                    return Err(EngineError::InvalidLooper(node.id));
+                }
+                if let Some(clock) = clock {
+                    if !clocks.contains(&clock) {
+                        return Err(EngineError::UnknownLooperClock {
+                            looper: node.id,
+                            clock,
+                        });
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -357,9 +476,23 @@ pub(crate) fn prepare(description: &GraphDescription) -> Result<PreparedGraph, E
                     channel: usize::from(channel),
                 },
                 NodeKind::Gain { gain, muted } => Process::Gain(GainState::new(gain, muted)),
+                NodeKind::Looper { clock, .. } => {
+                    let shape =
+                        LooperShape::of(node.kind).ok_or(EngineError::InvalidLooper(node.id))?;
+                    let clock = clock.and_then(|clock| clocks.iter().position(|&c| c == clock));
+                    let keep = running.contains(&(node.id, shape));
+                    Process::Looper(Box::new(Looper::new(
+                        node.id,
+                        shape,
+                        clock,
+                        sample_rate,
+                        keep,
+                    )))
+                }
             },
             inputs: first_jack..input_jacks.len(),
             first_output: first_output[index],
+            outputs: usize::from(node.kind.outputs()),
         });
     }
 

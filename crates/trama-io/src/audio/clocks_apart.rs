@@ -106,7 +106,7 @@ impl Rig {
                 *sample = (AMPLITUDE * (std::f64::consts::TAU * FREQUENCY * time).sin()) as f32;
             }
             let at = self.start + Duration::from_secs_f64(input_due + self.input_late);
-            self.input.write(&self.captured, at);
+            self.input.write(&self.captured, at, 0.0);
             self.input_blocks += 1;
             self.input_late = self.jitter.next();
             None

@@ -21,11 +21,13 @@ pub struct EnginePatch {
 }
 
 /// A transport: it counts MIDI clock pulses (24 per quarter note) while it
-/// plays.
+/// plays. Its bars start on the pulse it starts on.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ClockDescription {
     pub id: ModuleId,
     pub bpm: f64,
+    /// Quarter notes in a bar, at least 1.
+    pub beats_per_bar: u32,
     /// The devices that get its MIDI clock, start and stop.
     pub midi_to: Vec<DeviceId>,
 }

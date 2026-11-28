@@ -11,6 +11,7 @@ use rtrb::{Consumer, Producer};
 use trama_protocol::{EngineCommand, EngineEvent, MidiOut};
 
 use crate::graph::{Frames, MAX_FRAMES};
+use crate::looper::Moment;
 use crate::patch::{Outbox, PreparedPatch};
 use crate::{EngineConfig, RAMP_SECONDS, ToProcessor};
 
@@ -27,6 +28,8 @@ pub struct EngineProcessor {
     ramp_frames: u32,
     /// Samples computed since the engine started: Trama's master clock.
     position: u64,
+    /// The sound card's round trip, in samples.
+    latency: u32,
 }
 
 impl EngineProcessor {
@@ -49,6 +52,7 @@ impl EngineProcessor {
             patch: Box::new(PreparedPatch::empty()),
             ramp_frames: (f64::from(config.sample_rate) * RAMP_SECONDS).round() as u32,
             position: 0,
+            latency: 0,
         }
     }
 
@@ -76,19 +80,31 @@ impl EngineProcessor {
             at: now,
         });
         self.read_inbox(block_start);
+        self.patch.time_clocks(block_start);
         self.patch.run_clocks(block_start, block_end, &mut self.out);
 
+        let PreparedPatch { graph, timings, .. } = &mut *self.patch;
         let mut offset = 0;
         while offset < frames {
             let len = (frames - offset).min(MAX_FRAMES);
-            self.patch.graph.run(Frames {
-                input,
-                input_channels,
-                output: &mut *output,
-                output_channels,
-                offset,
-                len,
-            });
+            let moment = Moment {
+                block_start,
+                piece_start: block_start + offset as u64,
+                clocks: timings,
+                latency: self.latency,
+            };
+            graph.run(
+                Frames {
+                    input,
+                    input_channels,
+                    output: &mut *output,
+                    output_channels,
+                    offset,
+                    len,
+                },
+                &moment,
+                &mut self.out,
+            );
             offset += len;
         }
         self.position = block_end;
@@ -115,7 +131,7 @@ impl EngineProcessor {
             match self.inbox.pop() {
                 Ok(ToProcessor::Command(command)) => self.apply(command, at),
                 Ok(ToProcessor::Patch(mut patch)) => {
-                    patch.continue_from(&self.patch, at, self.ramp_frames, &mut self.out);
+                    patch.continue_from(&mut self.patch, at, self.ramp_frames, &mut self.out);
                     let old = std::mem::replace(&mut self.patch, patch);
                     // There is room: checked above, and only this thread
                     // pushes.
@@ -132,7 +148,7 @@ impl EngineProcessor {
             EngineCommand::Play { clock } => patch.play(clock, at, &mut self.out),
             EngineCommand::Stop { clock } => patch.stop(clock, at, &mut self.out),
             EngineCommand::SetTempo { clock, bpm } => {
-                patch.set_tempo(clock, bpm, self.config.sample_rate);
+                patch.set_tempo(clock, bpm, self.config.sample_rate, at);
             }
             EngineCommand::SetStep { player, step, note } => patch.set_step(player, step, note),
             EngineCommand::SetGain { node, gain } => {
@@ -141,6 +157,22 @@ impl EngineProcessor {
             EngineCommand::SetMuted { node, muted } => {
                 patch.graph.set_muted(node, muted, self.ramp_frames);
             }
+            EngineCommand::QueueTrack {
+                node,
+                track,
+                action,
+            } => {
+                let latency = self.latency;
+                patch
+                    .graph
+                    .queue_track(node, track, action, at, latency, &mut self.out);
+            }
+            EngineCommand::DeleteClip { node, track, scene } => {
+                patch
+                    .graph
+                    .delete_clip(node, track, scene, at, &mut self.out);
+            }
+            EngineCommand::SetLatency { frames } => self.latency = frames,
         }
     }
 }
@@ -160,7 +192,7 @@ mod tests {
         let output = graph.add(NodeId(2), NodeKind::AudioOutput { channel: 0 });
         graph.connect(input.jack(0), level.jack(0));
         graph.connect(level.jack(0), output.jack(0));
-        Box::new(prepare(&EnginePatch::from(graph), 48_000).unwrap())
+        Box::new(prepare(&EnginePatch::from(graph), 48_000, &[]).unwrap())
     }
 
     #[test]

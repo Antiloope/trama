@@ -9,13 +9,13 @@ threads and crates. The reasons behind the main choices are in
 
 Trama connects instruments and controllers and plays them together, in time
 with the sound card. Inside, it is a **patch**: devices, modules that each
-do one job (a clock, a step sequencer, a gain), and connections between
-them. `trama play` builds one in code: an 8-step sequencer whose grid
-controller edits the pattern and shows the playhead, gamepads that add
-pitch bend and modulation, and a synth with a MIDI input that plays the
-notes and follows Trama's MIDI clock. Whatever reaches the sound card's
-inputs, a synth's audio or a microphone, can play through Trama to its
-outputs.
+do one job (a clock, a step sequencer, a gain, a looper), and connections
+between them. `trama play` builds one in code: an 8-step sequencer and a
+looper that share a grid controller, gamepads that add pitch bend and
+modulation, and a synth with a MIDI input that plays the notes and follows
+Trama's MIDI clock. Whatever reaches the sound card's inputs, a synth's
+audio or a microphone, can play through Trama to its outputs, and the
+looper records it into loops.
 
 Trama does three jobs, and each job is a layer:
 
@@ -41,7 +41,7 @@ Trama does three jobs, and each job is a layer:
         │ EnginePatch        │                    │
         ▼                    │                    │
  ┌────────────────────────────────────────────────────────────┐
- │ ENGINE   clocks, step players, audio graph                 │
+ │ ENGINE   clocks, step players, audio graph with loopers    │
  └────────────────────────────────────────────────────────────┘
         ▲ input block                │ output block
         │                            ▼
@@ -137,8 +137,8 @@ core, because notes and clock must land on the beat (see "Time").
 
 | Owner         | What it owns                                                                             |
 |---------------|------------------------------------------------------------------------------------------|
-| Core          | The patch: the devices it knows, the modules and the connections. Each module's state: a clock's tempo and transport; a sequencer's pattern, octave, playhead, last pitch bend and modulation; a gain's level. What each control shows |
-| Engine        | The patch it runs: each clock's position, each step player's copy of its pattern and the note it is holding, the master clock, the audio graph and the level of each gain |
+| Core          | The patch: the devices it knows, the modules and the connections. Each module's state: a clock's tempo and transport; a sequencer's pattern, octave, playhead, last pitch bend and modulation; a gain's level; which of a looper's clips hold a recording, and what each of its tracks does and waits to do. What each control shows |
+| Engine        | The patch it runs: each clock's position, each step player's copy of its pattern and the note it is holding, the master clock, the audio graph and the level of each gain, each looper's memory with its loops, and what its tracks play, record and wait for |
 | IO adapters   | Their connections to the outside; the synth outputs also keep the MIDI waiting to be sent |
 
 The core is the single source of truth for the patch and for every
@@ -176,10 +176,20 @@ Trama's modules:
 | clock          | `play`, `tempo_up`, `tempo_down`, `tempo` (BPM)       | `clock`; lights of `play`, `tempo_up`, `tempo_down` | a clock |
 | step sequencer | `grid` (rows × steps), `clear`, `octave_up`, `octave_down`, `pitch_bend`, `modulation`, `clock` | `notes`; lights of `grid`, `clear`, `octave_up`, `octave_down` | a step player |
 | gain           | `in` (audio), `level` (dB), `mute`                    | `out` (audio); light of `mute`  | a gain node |
+| looper         | `clips` (scenes × tracks), `scenes` (a column), `stop` (a row), `delete`, `clock`; audio `in_1`, `in_2`… per track and channel | audio `out_1`, `out_2`… per track and channel; lights of `clips`, `scenes`, `stop`, `delete` | a looper node |
 
 A sequencer has settings: steps (1 to 64), rows, root, scale, rate and MIDI
 channel. Any number of sequencers can play at once, each on its own
 channel and to its own devices.
+
+A looper has settings too: tracks and scenes (1 to 16 each), the channels
+of every track (1, or 2 for stereo: `in_1_left`, `in_1_right`…), whether
+its loops follow a clock or are free, the seconds of recording its clips
+share, and what a press on the clip a track plays does: stop it, or play
+it again from its start. A free looper has no `clock` input. A press on a
+clip records into it when it is empty, ends the recording when it records,
+plays it when it holds a recording; one with `delete` held empties it. A
+press on what a track waits to do cancels it.
 
 Every project has one **main clock**, the module `clock`, and it cannot be
 removed. A module that follows a tempo follows the clock connected to its
@@ -190,8 +200,8 @@ A **connection** goes from what produces to what receives:
 
 | From                                       | To                                              |
 |--------------------------------------------|-------------------------------------------------|
-| a control of a device, or a zone of a grid's pads | a control input of a module              |
-| a light output of a module                 | a control, or a zone of pads                    |
+| a control of a device, a zone of a grid's pads, or the buttons beside some of its rows | a control input of a module |
+| a light output of a module                 | a control, a zone of pads, or buttons beside rows |
 | a notes or clock output                    | a device's MIDI input                           |
 | a channel of the sound card's input, or an audio output | an audio input, or a channel of the sound card's output |
 | a clock output                             | a clock input                                   |
@@ -199,7 +209,9 @@ A **connection** goes from what produces to what receives:
 - A **zone** is a rectangle of a grid's pads. It meets a grid-shaped input
   or output with its bottom-left pad on cell (0, 0), so one grid can be
   split between several modules: the bottom four rows for one sequencer,
-  the top four for another.
+  the top four for another. The buttons beside consecutive rows meet an
+  input or output shaped like a column the same way, the lowest on cell
+  (0, 0), as a looper's scene buttons do.
 - A connection to a control input can **transform** moving values: from
   one range to another, along a straight line or an exponential curve. A
   knob's 0.0 to 1.0 becomes 60 to 180 BPM; a stick's -1.0 to 1.0, turned
@@ -229,7 +241,8 @@ Trama plays:
 - a step player in both keeps holding its note, if it still sends to the
   same devices on the same channel; otherwise the note is released where
   it was sent;
-- a device that stops getting a playing clock gets a stop.
+- a device that stops getting a playing clock gets a stop;
+- a looper in both keeps its memory and its loops (see "Loops").
 
 ## The audio graph
 
@@ -238,14 +251,16 @@ jacks, and cables between them, like a patchbay. A `GraphDescription` lists
 them:
 
 - **nodes**: one channel of the sound card's input (`AudioInput`), one
-  channel of its output (`AudioOutput`), a gain (`Gain`);
+  channel of its output (`AudioOutput`), a gain (`Gain`), a looper
+  (`Looper`), whose jacks are its tracks' channels;
 - **cables**: from an output jack of a node to an input jack of another.
   Every cable carries one channel, so stereo is two cables. An output jack
   can feed any number of cables, cables that reach the same input jack are
   summed, and cables never form a loop.
 
 The core writes it from the audio connections: each gain module is a gain
-node, and each channel of the sound card in use an input or output node.
+node, each looper a looper node, and each channel of the sound card in use
+an input or output node.
 The description is plain data and knows nothing about who wrote it. The
 engine's controller checks it and **prepares** it off the audio thread:
 it works out the order to run the nodes in (every node after the ones it
@@ -268,6 +283,70 @@ on their way than the queue holds.
 and the level glides to its new value over 10 ms, whatever the block
 size, so changes do not click. A gain that is in both the old graph and
 the new one keeps the level it was at and glides to its new one.
+
+## Loops
+
+A looper is a node of the audio graph with a track per column of its clip
+grid. Each track records what reaches its input jacks into one of its
+clips, and plays one clip at a time to its output jacks. The core says
+what a track does next (`QueueTrack`: record a clip, play one, stop), and
+the engine picks the sample it happens on and reports it
+(`EngineEvent::Track`), with the clips that gain or lose a recording
+(`EngineEvent::Clip`).
+
+- **On a clock**, a looper acts on the clock's bars: what a track is asked
+  to do waits for the first sample of the next bar, and a recording lasts
+  whole bars. A clip plays at the speed that fits its bars into the
+  clock's tempo, like tape, so a faster tempo is also higher. The engine
+  works out the place in the clip from the clock's place in the bar, so a
+  loop never drifts from the clock. At another speed than it was recorded
+  at, a clip is interpolated between its samples, along a cubic (Hermite)
+  curve. When the clock stops, the looper's tracks stop; a recording keeps
+  its whole bars.
+- **Free**, a looper acts at the start of the next block and plays its
+  clips at the speed they were recorded at, so loops of different lengths
+  drift against each other.
+- A clip fades in and out over 3 ms when it starts and stops, and its last
+  10 ms are crossfaded with the 10 ms that came before its first sample, so
+  its end leads into its start without a click.
+
+### Walk-through: recording a loop
+
+1. A press on pad (5, 2) reaches the looper as a press on cell (1, 2) of
+   `clips`: scene 1 of track 2. The clip is empty, so the looper asks the
+   engine to record it, and lights the pad flashing red.
+2. On the first sample of the next bar, the engine starts the recording and
+   reports it. The pad turns solid red.
+3. Another press asks the engine to play the clip. On the first sample of
+   the bar after that, the engine ends the recording, which lasts whole
+   bars, and plays it from its start. The pad turns green.
+
+### Memory
+
+Recording must never allocate, so a looper's memory is allocated when it
+joins the patch, off the audio thread: chunks of 4096 frames for the
+seconds its settings give, written to once so the system has provided
+every page before the audio thread needs it. A clip takes chunks as it
+records and gives them back when it is emptied. A recording that finds no
+chunk left keeps what fits, in whole bars on a clock, and plays it.
+
+The engine's controller remembers the loopers of the last patch it sent.
+In the next patch, a looper with the same node id and the same shape gets
+no memory of its own, and the swap moves the running looper's memory,
+loops and all, into it. The loops are the one piece of a module's state
+that only the engine has: they are audio, and they never cross to the
+core.
+
+### Latency
+
+A sound played along with what the speakers play reaches the engine
+later: the time the output takes to be heard, the time the input takes to
+arrive, and the cushion between them. The sound card adapter adds up what
+the system reports for each and what waits in the cushion, smoothed over a
+second or so, and `trama play` hands that round trip to the engine
+(`SetLatency`), plus `--latency-trim`. A looper starts and ends every
+recording that much later than the bar, so the loop holds what was played
+on the beat.
 
 ## Audio input
 
@@ -342,10 +421,14 @@ asks for audio every 21 ms. The engine counts samples, and that count is
 Trama's master clock. Each clock of the patch turns the count and its
 tempo into MIDI clock pulses (24 per quarter note) while it plays, and each
 step player turns the pulses of the clock it follows into steps: 6 pulses
-a step for sixteenth notes, 12 for eighth notes.
+a step for sixteenth notes, 12 for eighth notes. A clock's bars have four
+beats, 96 pulses, counted from the pulse it starts on; loopers act on
+them. A new tempo takes effect at the start of the next block, the pulse
+under way included, so a clock keeps its place in the bar.
 
 - **Everything on the beat is decided inside the engine**, in samples: the
-  MIDI clock, step starts, note ons and note offs.
+  MIDI clock, step starts, note ons and note offs, and when loops start,
+  stop and record.
 - **Engine commands take effect at the start of the next block.**
 - **MIDI to hardware**: the engine writes time-stamped MIDI into its own
   queue, each message naming the device it is for, and the synth outputs
@@ -479,18 +562,27 @@ The main outside libraries:
 
 `trama doctor` lists the audio outputs and inputs, with their channels, and
 the MIDI ports and gamepads it finds. `trama play` runs the step sequencer
-and monitors the sound card's inputs; everything it needs comes from its
-command-line options.
+and the looper, and monitors the sound card's inputs; everything it needs
+comes from its command-line options.
 
 `trama play` builds its patch in code:
 
 - the module `sequencer`, with the root, scale, rate and channel of the
-  command line, on the main clock at `--bpm`;
+  command line, on the main clock at `--bpm`, with a row for each row of
+  the grid the looper leaves it;
+- the loopers, with a scene for each of the grid's top `--looper-rows`
+  rows (4 unless it says otherwise): `looper` on the main clock, and
+  `free-looper` for the right `--free-columns` columns. Each track records
+  the input channels `--loop` names, mono or stereo, and plays to its
+  output channels;
 - the device `synth` gets the sequencer's notes and the main clock;
-- the device `pads`, a grid: its 8 × 8 pads to the sequencer's grid and
-  back, the row button beside the top row to the clock's `play`, the one
-  beside the bottom row to `clear`, up and down to the octave, left and
-  right to the tempo, each lit by what it does;
+- the device `pads`, a grid: its top rows to the loopers' clips and back,
+  and the buttons beside them to the scenes of both loopers; the rows
+  below to the sequencer's grid and back. The buttons beside the
+  sequencer's rows go, from the bottom, to the clock's `play`, the
+  loopers' `delete` and the sequencer's `clear`, as many as there are
+  rows. Up and down go to the octave, left and right to the tempo, each lit
+  by what it does;
 - every gamepad, a device of its own (`gamepad-1`, `gamepad-2`, …),
   connected when it appears: `south` to `play`, the D-pad like the grid's
   arrows, the left stick to `pitch_bend`, the right trigger to
@@ -513,12 +605,14 @@ Starting:
 4. start the audio streams, which moves the processor to the audio thread;
 5. run the core on the main thread: wait up to 1 ms for an input, handle
    it, then read whatever the engine reported and how the audio input is
-   doing.
+   doing, and hand the engine the round trip when it moves by a
+   millisecond or more.
 
 Stopping (Ctrl+C):
 
-1. the core stops the main clock, centers the pitch bend, sends "all notes
-   off", mutes the gains and turns every light off;
+1. the core stops the main clock, and with it the looper on it, stops the
+   free looper's tracks, centers the pitch bend, sends "all notes off",
+   mutes the gains and turns every light off;
 2. the engine gets 100 ms to process the stop, release the last note and
    fade monitoring out;
 3. the audio streams close;

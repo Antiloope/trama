@@ -33,24 +33,30 @@ versions.
 From fastest to slowest:
 
 1. **Unit tests**, next to the code they test: names, MIDI encoding,
-   scales and note names, zones and transforms, Launchpad bytes, gamepad
-   events, the clock map, the cushion between the audio input and output
-   and the loop that steers its resampler, the patch `trama play` builds.
+   scales and note names, zones, row buttons and transforms, Launchpad
+   bytes, gamepad events, the clock map, the cushion between the audio
+   input and output, its round trip and the loop that steers its
+   resampler, the patch `trama play` builds and how it shares the grid.
    `crates/trama-io/src/audio/clocks_apart.rs` runs an input and an output
    offline on clocks that drift apart, for minutes, and checks that the
    cushion stays put and a sine comes out clean.
 2. **The core as a black box** (`crates/trama-core/tests`): devices,
    modules and connections set up, inputs in, engine commands,
    notifications and the engine patch out. `step_sequencer.rs` connects the
-   sequencer as `trama play` does; `patch.rs` checks what connections
-   accept, refuse and carry.
+   sequencer as `trama play` does; `looper.rs` presses clips, scenes, stop
+   and delete and feeds back what the engine reports; `patch.rs` checks
+   what connections accept, refuse and carry.
 3. **The engine offline** (`crates/trama-engine/tests`): it runs without a
    sound card. `offline.rs` checks which MIDI comes out on which sample,
    for several block sizes and while patches are swapped; `graph.rs` feeds
-   the audio graph synthetic input and checks exactly what comes out.
+   the audio graph synthetic input and checks exactly what comes out;
+   `looper.rs` records loops and checks on which sample they start, what
+   they play back, at which speed, and what a full memory, a stopped clock,
+   the latency and a swap do to them.
 4. **Real-time safety** (`crates/trama-engine/tests/realtime.rs`): the
    processor runs under `assert_no_alloc`, which aborts the test if the
-   audio path allocates. `clocks_apart.rs` does the same for the input's
+   audio path allocates, with step players, gains and loopers recording,
+   playing and being swapped. `clocks_apart.rs` does the same for the input's
    resampler and the cushion.
 5. **End to end, without hardware**: `cargo run -p trama-io --example
    fake_gear` creates a pretend Launchpad and synth on virtual MIDI ports
