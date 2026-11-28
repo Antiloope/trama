@@ -16,6 +16,8 @@
 | Command                                     | What it does                               |
 |---------------------------------------------|--------------------------------------------|
 | `cargo run -- doctor`                       | list the audio outputs and inputs, MIDI ports and gamepads Trama finds |
+| `cargo run --release`                       | run the server, in this terminal           |
+| `cargo run -- status`                       | ask the running server what it has open    |
 | `cargo run --release -- play`               | play, with an optimized build              |
 | `cargo test --workspace`                    | every test in every crate                  |
 | `cargo fmt --all`                           | format the code                            |
@@ -36,7 +38,8 @@ From fastest to slowest:
    scales and note names, zones, row buttons and transforms, Launchpad
    bytes, gamepad events, the clock map, the cushion between the audio
    input and output, its round trip and the loop that steers its
-   resampler, the patch `trama play` builds and how it shares the grid.
+   resampler, the patch `trama play` builds and how it shares the grid,
+   the server's lock and how it lets go of a client that falls behind.
    `crates/trama-io/src/audio/clocks_apart.rs` runs an input and an output
    offline on clocks that drift apart, for minutes, and checks that the
    cushion stays put and a sine comes out clean.
@@ -53,21 +56,27 @@ From fastest to slowest:
    `looper.rs` records loops and checks on which sample they start, what
    they play back, at which speed, and what a full memory, a stopped clock,
    the latency and a swap do to them.
-4. **Real-time safety** (`crates/trama-engine/tests/realtime.rs`): the
+4. **The server as a black box** (`crates/trama/tests/server.rs`): it
+   starts inside the test with no sound card, on a free port and a
+   temporary user data folder, and is driven through its API. Two
+   WebSocket clients see the same change, a control a module does not have
+   is refused with its reason, requests from other sites are refused, and
+   a second server says where the first one is.
+5. **Real-time safety** (`crates/trama-engine/tests/realtime.rs`): the
    processor runs under `assert_no_alloc`, which aborts the test if the
    audio path allocates, with step players, gains and loopers recording,
    playing and being swapped. `clocks_apart.rs` does the same for the input's
    resampler and the cushion.
-5. **End to end, without hardware**: `cargo run -p trama-io --example
+6. **End to end, without hardware**: `cargo run -p trama-io --example
    fake_gear` creates a pretend Launchpad and synth on virtual MIDI ports
    (Linux and macOS). Point `trama play` at them (`--pads "Fake LPX" --synth
    "Fake Synth" --no-gamepad`) and it presses pads, plays, stops, and
    reports the notes the synth got and how steady the MIDI clock was.
-6. **With the gear**: `trama doctor`, then `trama play` with the real
+7. **With the gear**: `trama doctor`, then `trama play` with the real
    devices.
 
-CI (`.github/workflows/ci.yml`) runs formatting, clippy and tests 1 to 4 on
-Linux and macOS for every push, and checks licenses. Tests 5 and 6 need a
+CI (`.github/workflows/ci.yml`) runs formatting, clippy and tests 1 to 5 on
+Linux and macOS for every push, and checks licenses. Tests 6 and 7 need a
 MIDI system and hardware, so they are run by hand.
 
 ## Documentation

@@ -266,6 +266,67 @@ When an input is open, its monitoring gains start muted unless `--monitor`
 gives them a level, because a microphone next to speakers howls, and
 nothing is connected until `--connect` says so.
 
+## A server owns the open project
+
+Trama runs as a server with one project open, and every other way to use
+it, a command in another terminal or a web page, is a client of one API.
+One sound card and one set of controllers can serve one project, and the
+state has one owner, so several clients at once see the same project and
+the same changes, and nothing needs a screen. The core stays plain logic
+on a thread of its own: requests reach it as messages, one at a time, as
+inputs do.
+
+The scratch project is open when the server starts. It lives in `scratch/`
+in the user data folder, where the XDG rules on Linux and Application
+Support on macOS put a program's data, laid out like a project folder.
+It has no devices, so the server opens only the system's default audio
+output, the clock every project needs, and no input, as "Inputs stay
+closed" says. Without a sound card it runs anyway, and says that nothing
+plays, so it also runs in tests and on machines without audio.
+
+## The API is HTTP and a WebSocket on localhost
+
+Requests are HTTP with JSON, which browsers, `curl` and any language
+speak. Changes come over a WebSocket, which browsers have and which pushes
+them as they happen instead of being asked again and again. The port is
+8726, "TRAM" on a phone's keypad; `--port` picks another when it is taken.
+
+The API runs on axum, the most maintained of Rust's HTTP servers, with
+WebSockets built in, on a tokio runtime of one thread. Async code stays
+inside the API's thread: the rest of Trama keeps its threads and
+channels. Commands use ureq, a blocking HTTP client without TLS, since
+they only talk to localhost. All three are MIT or Apache-2.0.
+
+## Clients get a snapshot, then every change
+
+A client that connects gets the whole status first and every change after
+it. The project's thread puts both in the client's queue, in the order
+they happened, so a client never misses a change between the two or sees
+one twice. A client that falls 4096 changes behind is dropped rather than
+waited for: a phone on a slow network must never slow the core, and it
+reconnects to a fresh snapshot. Lights and MIDI are for devices, and there
+are many of them, so clients get what modules show instead: transport,
+steps, playheads.
+
+## Pages of other sites cannot drive Trama
+
+Listening on localhost keeps other computers out, but not the web pages
+open in the user's browser, which can send requests to localhost. One
+could start the transport, or turn up a gain. So the server answers only requests whose `Host` is
+localhost with its port, which defeats a site that points its own name at
+this computer, and refuses any `Origin` other than its own pages. Controls
+must be JSON, which a page of another site cannot post without the
+browser asking first, and the server never says yes.
+
+## One server at a time, found through a lock
+
+Two servers would fight over the sound card, the controllers and the
+scratch project. The server holds a lock file in the user data folder,
+locked by the system, so a crash releases it and a stale file never
+blocks the next start. The file also holds the port, so commands find
+the server on any port without being told, and a second server or `trama
+play` can say where the first one is.
+
 ## cpal's native PipeWire backend on Linux
 
 PipeWire is the sound server of most current Linux desktops, and talking

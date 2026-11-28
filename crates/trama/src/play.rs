@@ -21,6 +21,7 @@ use anyhow::Context;
 use clap::Args;
 use crossbeam_channel::{RecvTimeoutError, Sender};
 use patch::{Layout, Monitoring, PADS, SYNTH};
+use trama::user_data::{Running, UserData};
 use trama_core::modules::step_sequencer::StepSequencerSettings;
 use trama_core::music::{Scale, note_name, parse_note};
 use trama_core::{Core, Output};
@@ -182,6 +183,19 @@ enum CoreMessage {
 }
 
 pub fn run(args: PlayArgs) -> anyhow::Result<()> {
+    // A server and `trama play` would fight over the sound card and the
+    // controllers.
+    let running = UserData::find().and_then(|data| Ok(data.running_server()?));
+    match running {
+        Ok(Some(Running::At { port })) => anyhow::bail!(
+            "a Trama server is running at http://localhost:{port}; stop it (Ctrl+C in its \
+             terminal) before `trama play`"
+        ),
+        Ok(Some(Running::Starting)) => anyhow::bail!(
+            "a Trama server is starting; stop it (Ctrl+C in its terminal) before `trama play`"
+        ),
+        Ok(None) | Err(_) => {}
+    }
     let channel = Channel::from_number(args.channel).context("MIDI channel")?;
     let synth_port = match args.synth.as_str() {
         "none" => None,
