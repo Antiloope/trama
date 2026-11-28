@@ -123,6 +123,7 @@ pub(crate) enum EngineHalf {
     None,
     Clock {
         bpm: f64,
+        beats_per_bar: u32,
     },
     StepPlayer {
         channel: Channel,
@@ -133,6 +134,16 @@ pub(crate) enum EngineHalf {
     /// One node of the audio graph. Its jacks are the module's audio
     /// inputs and outputs, in the order its definition lists them.
     Node(NodeKind),
+    /// A looper node of the audio graph, with jacks like
+    /// [`EngineHalf::Node`]'s. One that is `synced` follows the clock the
+    /// module follows.
+    Looper {
+        tracks: u8,
+        scenes: u8,
+        channels: u8,
+        seconds: u32,
+        synced: bool,
+    },
 }
 
 pub(crate) trait Module {

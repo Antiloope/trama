@@ -1,28 +1,29 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! The patch `trama play` builds in code: a step sequencer on the main
-//! clock, played from a grid and from every gamepad, sending its notes and
-//! the main clock to a synth; and the sound card's inputs monitored through
-//! a gain for each output channel they reach.
+//! The patch `trama play` builds in code: a step sequencer and loopers
+//! sharing a grid, a sequencer played from every gamepad and sending its
+//! notes and the main clock to a synth, and the sound card's inputs
+//! monitored through a gain for each output channel they reach.
 
 use std::collections::BTreeSet;
 
 use trama_core::modules::gain::GainSettings;
+use trama_core::modules::looper::{LoopTiming, LooperSettings};
 use trama_core::modules::step_sequencer::StepSequencerSettings;
-use trama_core::{Connection, Core, MAIN_CLOCK, ModuleSettings, PatchError, Point, Zone};
+use trama_core::{
+    Connection, Core, Direction, MAIN_CLOCK, ModuleSettings, PatchError, Point, PortKind,
+    RowButtons, Zone,
+};
 use trama_protocol::{Control, DeviceId, ModuleId};
 
 pub const SEQUENCER: ModuleId = module("sequencer");
+pub const LOOPER: ModuleId = module("looper");
+pub const FREE_LOOPER: ModuleId = module("free-looper");
 pub const PADS: DeviceId = device("pads");
 pub const SYNTH: DeviceId = device("synth");
 
-/// The pads the sequencer's grid uses: 8 × 8 from the bottom-left corner.
-const GRID: Zone = Zone {
-    row: 0,
-    column: 0,
-    rows: 8,
-    columns: 8,
-};
+/// The rows and columns of the grid's pads.
+const GRID_SIZE: u8 = 8;
 
 const fn module(name: &str) -> ModuleId {
     match ModuleId::new(name) {
@@ -38,8 +39,116 @@ const fn device(name: &str) -> DeviceId {
     }
 }
 
-pub fn add_sequencer(core: &mut Core, settings: StepSequencerSettings) -> Result<(), PatchError> {
+/// How the grid's 8 × 8 pads are shared. The top `looper_rows` rows are
+/// clips, a scene per row: the left columns on the main clock, the right
+/// `free_columns` free. The rows below are the sequencer's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Layout {
+    /// 0 to 7: the sequencer keeps at least one row.
+    pub looper_rows: u8,
+    /// 0 to 8.
+    pub free_columns: u8,
+}
+
+/// A looper of the layout: its module, how it keeps time, and its columns.
+struct LooperPlace {
+    id: ModuleId,
+    timing: LoopTiming,
+    column: u8,
+    columns: u8,
+}
+
+impl Layout {
+    pub fn sequencer_rows(self) -> u8 {
+        GRID_SIZE - self.looper_rows
+    }
+
+    fn loopers(self) -> Vec<LooperPlace> {
+        if self.looper_rows == 0 {
+            return Vec::new();
+        }
+        let free = self.free_columns.min(GRID_SIZE);
+        let synced = GRID_SIZE - free;
+        [
+            (LOOPER, LoopTiming::Synced, 0, synced),
+            (FREE_LOOPER, LoopTiming::Free, synced, free),
+        ]
+        .into_iter()
+        .filter(|&(_, _, _, columns)| columns > 0)
+        .map(|(id, timing, column, columns)| LooperPlace {
+            id,
+            timing,
+            column,
+            columns,
+        })
+        .collect()
+    }
+}
+
+/// The sequencer, with as many rows as the layout leaves it.
+pub fn add_sequencer(
+    core: &mut Core,
+    settings: StepSequencerSettings,
+    layout: Layout,
+) -> Result<(), PatchError> {
+    let settings = StepSequencerSettings {
+        rows: layout.sequencer_rows(),
+        ..settings
+    };
     core.add_module(SEQUENCER, ModuleSettings::StepSequencer(settings))?;
+    Ok(())
+}
+
+/// The layout's loopers, each track with `channels` channels.
+pub fn add_loopers(core: &mut Core, layout: Layout, channels: u8) -> Result<(), PatchError> {
+    for looper in layout.loopers() {
+        core.add_module(
+            looper.id,
+            ModuleSettings::Looper(LooperSettings {
+                tracks: looper.columns,
+                scenes: layout.looper_rows,
+                channels,
+                timing: looper.timing,
+                ..LooperSettings::default()
+            }),
+        )?;
+    }
+    Ok(())
+}
+
+/// Every track of every looper records the input channels of `cables` and
+/// plays to their output channels, one cable per channel of the track,
+/// counting channels from 1.
+pub fn connect_loop_audio(
+    core: &mut Core,
+    layout: Layout,
+    cables: &[(u16, u16)],
+) -> Result<(), PatchError> {
+    let channels = cables.len().max(1);
+    for looper in layout.loopers() {
+        let audio = |direction| -> Vec<&'static str> {
+            core.ports(looper.id)
+                .unwrap_or_default()
+                .iter()
+                .filter(|p| p.kind == PortKind::Audio && p.direction == direction)
+                .map(|p| p.name)
+                .collect()
+        };
+        let (inputs, outputs) = (audio(Direction::Input), audio(Direction::Output));
+        for (index, (input, output)) in inputs.iter().zip(&outputs).enumerate() {
+            let Some(&(from, to)) = cables.get(index % channels) else {
+                continue;
+            };
+            core.connect(Connection::new(
+                Point::AudioIn(from - 1),
+                Point::module(looper.id, input),
+            ))?;
+            core.connect(Connection::new(
+                Point::module(looper.id, output),
+                Point::AudioOut(to - 1),
+            ))?;
+        }
+    }
     Ok(())
 }
 
@@ -55,31 +164,82 @@ pub fn connect_synth(core: &mut Core, synth: DeviceId) -> Result<(), PatchError>
     Ok(())
 }
 
-/// The grid edits the pattern and shows it. The row button beside the top
-/// row plays and stops, the one beside the bottom row clears; up and down
-/// move the octave, left and right the tempo. Each control shows the light
-/// of what it does.
-pub fn connect_pads(core: &mut Core, pads: DeviceId) -> Result<(), PatchError> {
+/// The grid as `layout` shares it. The buttons beside the looper's rows
+/// launch scenes. Beside the sequencer's rows, from the bottom: play and
+/// stop, delete (held, with a clip), clear the pattern, as far as there
+/// are rows. Up and down move the octave, left and right the tempo. Each
+/// control shows the light of what it does.
+pub fn connect_pads(core: &mut Core, pads: DeviceId, layout: Layout) -> Result<(), PatchError> {
     core.add_device(pads);
+    let both_ways = |core: &mut Core, control: Point, port: Point, lit: bool| {
+        core.connect(Connection::new(control, port))?;
+        if lit {
+            core.connect(Connection::new(port, control))?;
+        }
+        Ok::<(), PatchError>(())
+    };
+    let sequencer_rows = layout.sequencer_rows();
     let grid = Point::Pads {
         device: pads,
-        zone: GRID,
+        zone: Zone {
+            row: 0,
+            column: 0,
+            rows: sequencer_rows,
+            columns: GRID_SIZE,
+        },
     };
-    let sequencer_grid = Point::module(SEQUENCER, "grid");
-    core.connect(Connection::new(grid, sequencer_grid))?;
-    core.connect(Connection::new(sequencer_grid, grid))?;
+    both_ways(core, grid, Point::module(SEQUENCER, "grid"), true)?;
+
+    let loopers = layout.loopers();
+    let scenes = Point::RowButtons {
+        device: pads,
+        rows: RowButtons {
+            row: sequencer_rows,
+            count: layout.looper_rows,
+        },
+    };
+    for (index, looper) in loopers.iter().enumerate() {
+        let clips = Point::Pads {
+            device: pads,
+            zone: Zone {
+                row: sequencer_rows,
+                column: looper.column,
+                rows: layout.looper_rows,
+                columns: looper.columns,
+            },
+        };
+        both_ways(core, clips, Point::module(looper.id, "clips"), true)?;
+        // One looper lights the buttons both of them listen to.
+        both_ways(core, scenes, Point::module(looper.id, "scenes"), index == 0)?;
+    }
+
+    let mut functions: Vec<Vec<(ModuleId, &'static str)>> = vec![vec![(MAIN_CLOCK, "play")]];
+    if !loopers.is_empty() {
+        functions.push(loopers.iter().map(|l| (l.id, "delete")).collect());
+    }
+    functions.push(vec![(SEQUENCER, "clear")]);
+    for (row, ports) in functions
+        .into_iter()
+        .enumerate()
+        .take(usize::from(sequencer_rows))
+    {
+        let control = Point::control(pads, Control::RowButton { row: row as u8 });
+        for (index, (module, port)) in ports.into_iter().enumerate() {
+            both_ways(core, control, Point::module(module, port), index == 0)?;
+        }
+    }
     for (control, module, port) in [
-        (Control::RowButton { row: 7 }, MAIN_CLOCK, "play"),
-        (Control::RowButton { row: 0 }, SEQUENCER, "clear"),
         (Control::Button("up"), SEQUENCER, "octave_up"),
         (Control::Button("down"), SEQUENCER, "octave_down"),
         (Control::Button("left"), MAIN_CLOCK, "tempo_down"),
         (Control::Button("right"), MAIN_CLOCK, "tempo_up"),
     ] {
-        let control = Point::control(pads, control);
-        let port = Point::module(module, port);
-        core.connect(Connection::new(control, port))?;
-        core.connect(Connection::new(port, control))?;
+        both_ways(
+            core,
+            Point::control(pads, control),
+            Point::module(module, port),
+            true,
+        )?;
     }
     Ok(())
 }
@@ -200,23 +360,91 @@ mod tests {
         output[(frames - 1) * outputs..].to_vec()
     }
 
-    #[test]
-    fn the_whole_patch_runs() {
+    const SPLIT: Layout = Layout {
+        looper_rows: 4,
+        free_columns: 2,
+    };
+
+    fn whole_patch(layout: Layout) -> Core {
         let mut core = Core::new(120.0);
-        add_sequencer(&mut core, StepSequencerSettings::default()).unwrap();
+        add_sequencer(&mut core, StepSequencerSettings::default(), layout).unwrap();
+        add_loopers(&mut core, layout, 2).unwrap();
+        connect_loop_audio(&mut core, layout, &[(1, 1), (2, 2)]).unwrap();
         Monitoring::add(&mut core, &[(1, 1), (1, 2)], Some(-6.0)).unwrap();
         connect_synth(&mut core, SYNTH).unwrap();
-        connect_pads(&mut core, PADS).unwrap();
+        connect_pads(&mut core, PADS, layout).unwrap();
         for gamepad in ["gamepad-1", "gamepad-2"] {
             connect_gamepad(&mut core, DeviceId::new(gamepad).unwrap()).unwrap();
         }
+        core
+    }
+
+    #[test]
+    fn the_whole_patch_runs() {
+        let mut core = whole_patch(SPLIT);
         let patch = core.take_engine_patch().unwrap();
         assert_eq!(patch.clocks[0].midi_to, vec![SYNTH]);
         assert_eq!(patch.step_players[0].midi_to, vec![SYNTH]);
+        assert_eq!(patch.step_players[0].pattern.len(), 8);
         let mut engine = Engine::new(EngineConfig::new(48_000));
         engine.controller.set_patch(&patch).unwrap();
-        // 64 pads and 6 buttons, lit once Trama starts.
-        assert_eq!(core.start().len(), 64 + 6 + 1);
+        // 64 pads, 4 scene buttons, play, delete, clear and 4 arrows, lit
+        // once Trama starts, and the pitch bend centered.
+        assert_eq!(core.start().len(), 64 + 4 + 3 + 4 + 1);
+    }
+
+    #[test]
+    fn the_grid_is_shared_as_the_layout_says() {
+        let core = whole_patch(SPLIT);
+        let ports = |id| core.ports(id).unwrap().to_vec();
+        let grid = |ports: &[trama_core::Port], name| {
+            ports
+                .iter()
+                .find(|p| p.name == name && p.direction == Direction::Input)
+                .map(|p| p.shape)
+        };
+        use trama_core::Shape;
+        assert_eq!(
+            grid(&ports(SEQUENCER), "grid"),
+            Some(Shape::Grid {
+                rows: 4,
+                columns: 8
+            })
+        );
+        assert_eq!(
+            grid(&ports(LOOPER), "clips"),
+            Some(Shape::Grid {
+                rows: 4,
+                columns: 6
+            })
+        );
+        assert_eq!(
+            grid(&ports(FREE_LOOPER), "clips"),
+            Some(Shape::Grid {
+                rows: 4,
+                columns: 2
+            })
+        );
+        // Every stereo track records inputs 1 and 2 and plays to outputs
+        // 1 and 2.
+        let audio = core
+            .connections()
+            .iter()
+            .filter(|c| {
+                matches!(c.from, Point::AudioIn(_)) && c.to.to_string().starts_with("looper")
+            })
+            .count();
+        assert_eq!(audio, 6 * 2);
+
+        let only_sequencer = whole_patch(Layout {
+            looper_rows: 0,
+            free_columns: 0,
+        });
+        assert_eq!(
+            only_sequencer.modules().count(),
+            1 + 1 + 2,
+            "clock, sequencer, gains"
+        );
     }
 
     #[test]

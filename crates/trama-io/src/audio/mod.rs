@@ -203,9 +203,14 @@ impl OutputDevice {
             .device
             .build_output_stream(
                 self.config,
-                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
                     let now = Instant::now();
                     let frames = data.len() / output_channels;
+                    if let Some(reader) = reader.as_mut() {
+                        let times = info.timestamp();
+                        let heard_after = times.playback.duration_since(times.callback);
+                        reader.note_round_trip(heard_after.as_secs_f64(), sample_rate);
+                    }
                     let mut done = 0;
                     while done < frames {
                         let len = (frames - done).min(RENDER_FRAMES);
@@ -333,8 +338,10 @@ impl InputDevice {
             .device
             .build_input_stream(
                 self.config,
-                move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    writer.write(data, Instant::now());
+                move |data: &[f32], info: &cpal::InputCallbackInfo| {
+                    let times = info.timestamp();
+                    let delay = times.callback.duration_since(times.capture);
+                    writer.write(data, Instant::now(), delay.as_secs_f64());
                 },
                 |error| eprintln!("audio input: {error}"),
                 None,
@@ -354,10 +361,15 @@ enum InputWriter {
 }
 
 impl InputWriter {
-    fn write(&mut self, samples: &[f32], at: Instant) {
+    /// Writes one input block, captured by `at`, which took `delay`
+    /// seconds to get from the device to the callback.
+    fn write(&mut self, samples: &[f32], at: Instant, delay: f64) {
         match self {
-            InputWriter::Direct(writer) => writer.write(samples, at),
-            InputWriter::Resampled(resampler) => resampler.write(samples, at),
+            InputWriter::Direct(writer) => {
+                writer.set_input_delay(delay);
+                writer.write(samples, at);
+            }
+            InputWriter::Resampled(resampler) => resampler.write(samples, at, delay),
         }
     }
 }
@@ -377,7 +389,8 @@ pub struct AudioOutput {
 }
 
 impl AudioOutput {
-    /// How the input has fared, if one was opened.
+    /// How the input has fared, if one was opened, and how long its round
+    /// trip with the output takes.
     pub fn input_stats(&self) -> Option<InputStats> {
         self.counters.as_ref().map(|counters| counters.stats())
     }

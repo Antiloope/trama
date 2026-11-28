@@ -6,7 +6,8 @@
 //! master clock by counting them. It runs an [`EnginePatch`]: the engine
 //! halves of modules. Clocks send MIDI clock and step players play their
 //! patterns, all placed on exact samples, and the audio graph, the patch
-//! of nodes and cables, turns the sound card's input into its output.
+//! of nodes and cables, turns the sound card's input into its output,
+//! recording and playing loops on the way.
 //!
 //! It is split in two halves that talk through lock-free queues:
 //!
@@ -30,14 +31,16 @@
 
 mod error;
 mod graph;
+mod looper;
 mod patch;
 mod processor;
 
 pub use error::EngineError;
+use looper::LooperShape;
 use patch::PreparedPatch;
 pub use processor::EngineProcessor;
 use rtrb::{Consumer, Producer, RingBuffer};
-use trama_protocol::{EngineCommand, EngineEvent, EnginePatch, MidiOut};
+use trama_protocol::{EngineCommand, EngineEvent, EnginePatch, MidiOut, NodeId};
 
 /// MIDI clock pulses per quarter note, fixed by the MIDI standard.
 pub const PULSES_PER_QUARTER: u32 = 24;
@@ -96,6 +99,7 @@ impl Engine {
                 retired: retired_rx,
                 patches_in_flight: 0,
                 events: event_rx,
+                loopers: Vec::new(),
             },
             processor: EngineProcessor::new(config, inbox_rx, retired_tx, event_tx, midi_tx),
             midi: midi_rx,
@@ -111,6 +115,10 @@ pub struct EngineController {
     /// Patches sent whose predecessors have not come back yet.
     patches_in_flight: usize,
     events: Consumer<EngineEvent>,
+    /// The loopers of the last patch sent. The processor swaps patches in
+    /// the order they are sent, so the next patch replaces that one, and
+    /// its loopers take over that one's memory instead of allocating.
+    loopers: Vec<(NodeId, LooperShape)>,
 }
 
 impl EngineController {
@@ -128,16 +136,19 @@ impl EngineController {
     /// Prepares `patch` here, off the audio thread, and queues it. The
     /// processor starts running it at the start of the next block, after
     /// everything sent before it; commands sent afterwards reach the new
-    /// patch.
+    /// patch. A new looper's memory is allocated here; one the last patch
+    /// had keeps its memory, loops and all.
     pub fn set_patch(&mut self, patch: &EnginePatch) -> Result<(), EngineError> {
         self.free_retired_patches();
         if self.patches_in_flight >= PATCHES_IN_FLIGHT {
             return Err(EngineError::QueueFull);
         }
-        let prepared = Box::new(patch::prepare(patch, self.sample_rate)?);
+        let prepared = Box::new(patch::prepare(patch, self.sample_rate, &self.loopers)?);
+        let loopers = prepared.loopers();
         match self.inbox.push(ToProcessor::Patch(prepared)) {
             Ok(()) => {
                 self.patches_in_flight += 1;
+                self.loopers = loopers;
                 Ok(())
             }
             Err(rtrb::PushError::Full(_)) => Err(EngineError::QueueFull),

@@ -8,9 +8,10 @@ use std::time::Instant;
 
 use assert_no_alloc::{AllocDisabler, assert_no_alloc};
 use trama_engine::{Engine, EngineConfig};
+use trama_protocol::EngineEvent;
 use trama_protocol::{
     Channel, ClockDescription, DeviceId, EngineCommand, EnginePatch, GraphDescription, ModuleId,
-    NodeId, NodeKind, StepNote, StepPlayerDescription,
+    NodeId, NodeKind, StepNote, StepPlayerDescription, TrackAction, TrackState,
 };
 
 #[global_allocator]
@@ -89,11 +90,13 @@ fn patch(round: u32) -> EnginePatch {
             ClockDescription {
                 id: module("clock"),
                 bpm: 174.0,
+                beats_per_bar: 4,
                 midi_to: devices[..1 + round as usize % 3].to_vec(),
             },
             ClockDescription {
                 id: module("half"),
                 bpm: 87.0,
+                beats_per_bar: 4,
                 midi_to: Vec::new(),
             },
         ],
@@ -206,4 +209,135 @@ fn stopping_never_allocates() {
     assert_no_alloc(|| {
         processor.process(&[], 0, &mut output, 2, Instant::now());
     });
+}
+
+/// Two loopers on the first two input channels: one follows the clock,
+/// with two stereo tracks that share four seconds of memory, the other
+/// follows none and has two seconds.
+fn looper_patch() -> EnginePatch {
+    let mut graph = GraphDescription::new();
+    let inputs: Vec<NodeId> = (0..2)
+        .map(|c| graph.add(NodeId(c), NodeKind::AudioInput { channel: c as u16 }))
+        .collect();
+    let synced = graph.add(
+        NodeId(200),
+        NodeKind::Looper {
+            tracks: 2,
+            scenes: 2,
+            channels: 2,
+            seconds: 4,
+            clock: Some(module("clock")),
+        },
+    );
+    let free = graph.add(
+        NodeId(201),
+        NodeKind::Looper {
+            tracks: 1,
+            scenes: 1,
+            channels: 1,
+            seconds: 2,
+            clock: None,
+        },
+    );
+    let output = graph.add(NodeId(100), NodeKind::AudioOutput { channel: 0 });
+    for jack in 0..4 {
+        graph.connect(inputs[usize::from(jack % 2)].jack(0), synced.jack(jack));
+        graph.connect(synced.jack(jack), output.jack(0));
+    }
+    graph.connect(inputs[0].jack(0), free.jack(0));
+    graph.connect(free.jack(0), output.jack(0));
+    EnginePatch {
+        graph,
+        clocks: vec![ClockDescription {
+            id: module("clock"),
+            bpm: 174.0,
+            beats_per_bar: 4,
+            midi_to: Vec::new(),
+        }],
+        step_players: Vec::new(),
+    }
+}
+
+#[test]
+fn loopers_never_allocate() {
+    let mut engine = Engine::new(EngineConfig::new(48_000));
+    let input: Vec<f32> = (0..512 * 2).map(|i| (i as f32 * 0.01).sin()).collect();
+    let mut output = vec![0.0_f32; 512 * 2];
+    engine.controller.set_patch(&looper_patch()).unwrap();
+    let queue = |node: u32, track: u8, action: Option<TrackAction>| EngineCommand::QueueTrack {
+        node: NodeId(node),
+        track,
+        action,
+    };
+    let record = |scene| Some(TrackAction::Record { scene });
+    let play = |scene| Some(TrackAction::Play { scene });
+    let rounds = [
+        vec![
+            EngineCommand::SetLatency { frames: 300 },
+            EngineCommand::Play {
+                clock: module("clock"),
+            },
+            queue(200, 0, record(0)),
+            queue(200, 1, record(1)),
+            queue(201, 0, record(0)),
+        ],
+        vec![
+            queue(201, 0, play(0)),
+            queue(200, 0, play(0)),
+            EngineCommand::SetTempo {
+                clock: module("clock"),
+                bpm: 90.0,
+            },
+        ],
+        vec![
+            EngineCommand::DeleteClip {
+                node: NodeId(200),
+                track: 1,
+                scene: 1,
+            },
+            queue(201, 0, record(0)),
+            queue(200, 0, record(1)),
+            queue(200, 1, None),
+        ],
+        vec![
+            EngineCommand::Stop {
+                clock: module("clock"),
+            },
+            queue(201, 0, Some(TrackAction::Stop)),
+        ],
+    ];
+    let mut states = Vec::new();
+    for (round, commands) in rounds.into_iter().enumerate() {
+        for command in commands {
+            engine.controller.send(command).unwrap();
+        }
+        if round == 1 {
+            // A swap moves the loopers' memory into the new patch.
+            engine.controller.set_patch(&looper_patch()).unwrap();
+        }
+        let processor = &mut engine.processor;
+        assert_no_alloc(|| {
+            // Three seconds: the memory fills up.
+            for _ in 0..300 {
+                processor.process(&input, 2, &mut output, 2, Instant::now());
+            }
+        });
+        while let Some(event) = engine.controller.next_event() {
+            if let EngineEvent::Track { node, state, .. } = event {
+                states.push((node.0, state));
+            }
+        }
+    }
+    assert!(output.iter().all(|s| s.is_finite()));
+    // Both loopers recorded until their memory was full, played, and
+    // stopped.
+    for node in [200, 201] {
+        for state in [
+            TrackState::Recording { scene: 0 },
+            TrackState::Playing { scene: 0 },
+            TrackState::Stopped,
+        ] {
+            assert!(states.contains(&(node, state)), "{node}: {state:?}");
+        }
+    }
 }

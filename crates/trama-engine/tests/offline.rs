@@ -39,6 +39,7 @@ fn clock(midi_to: &[DeviceId]) -> ClockDescription {
     ClockDescription {
         id: CLOCK,
         bpm: 120.0,
+        beats_per_bar: 4,
         midi_to: midi_to.to_vec(),
     }
 }

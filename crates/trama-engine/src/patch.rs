@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! Patches ready to run on the audio thread: the audio graph, the clocks
-//! and the step players that follow them.
+//! Patches ready to run on the audio thread: the audio graph, loopers
+//! included, the clocks, and the step players that follow them.
 //!
 //! [`prepare`] checks an [`EnginePatch`] and allocates, off the audio
 //! thread, everything running it needs. Running a prepared patch, and
@@ -10,15 +10,18 @@
 use rtrb::Producer;
 use trama_protocol::{
     Channel, DeviceId, EngineEvent, EnginePatch, MAX_BPM, MAX_STEPS, MIN_BPM, MidiMessage, MidiOut,
-    ModuleId, StepNote,
+    ModuleId, NodeId, StepNote,
 };
 
 use crate::graph::{self, PreparedGraph};
+use crate::looper::{ClockTiming, LooperShape};
 use crate::{EngineError, PULSES_PER_QUARTER};
 
 pub(crate) struct PreparedPatch {
     pub(crate) graph: PreparedGraph,
     clocks: Vec<Clock>,
+    /// Where each clock was at the start of the block, for loopers.
+    pub(crate) timings: Vec<ClockTiming>,
     players: Vec<StepPlayer>,
 }
 
@@ -26,6 +29,7 @@ struct Clock {
     id: ModuleId,
     playing: bool,
     samples_per_pulse: f64,
+    pulses_per_bar: u32,
     /// Sample position of the next pulse. Kept as a fraction so pulses do
     /// not drift when a pulse is not a whole number of samples.
     next_pulse_at: f64,
@@ -73,7 +77,7 @@ impl Outbox {
         }
     }
 
-    fn event(&mut self, event: EngineEvent) {
+    pub(crate) fn event(&mut self, event: EngineEvent) {
         if self.events.push(event).is_err() {
             self.dropped += 1;
         }
@@ -85,8 +89,14 @@ impl PreparedPatch {
         PreparedPatch {
             graph: PreparedGraph::empty(),
             clocks: Vec::new(),
+            timings: Vec::new(),
             players: Vec::new(),
         }
+    }
+
+    /// The loopers it runs, with their shapes.
+    pub(crate) fn loopers(&self) -> Vec<(NodeId, LooperShape)> {
+        self.graph.loopers()
     }
 
     /// Starts clock `id` at sample `at`. Does nothing if it is playing or
@@ -106,7 +116,7 @@ impl PreparedPatch {
     }
 
     /// Stops clock `id` at sample `at`, releasing the notes of the step
-    /// players that follow it.
+    /// players that follow it and stopping the loopers that do.
     pub(crate) fn stop(&mut self, id: ModuleId, at: u64, out: &mut Outbox) {
         let Some(index) = self.clocks.iter().position(|c| c.id == id) else {
             return;
@@ -119,16 +129,38 @@ impl PreparedPatch {
         for player in self.players.iter_mut().filter(|p| p.clock == index) {
             player.release(at, out);
         }
-        out.send(&clock.midi_to, at, MidiMessage::Stop);
+        let midi_to = &self.clocks[index].midi_to;
+        out.send(midi_to, at, MidiMessage::Stop);
         out.event(EngineEvent::Stopped { clock: id });
+        self.graph.clock_stopped(index, at, out);
     }
 
-    pub(crate) fn set_tempo(&mut self, id: ModuleId, bpm: f64, sample_rate: u32) {
+    /// Sets the tempo of clock `id` from sample `at`. A clock that plays
+    /// keeps its place: the pulse under way stretches or shrinks.
+    pub(crate) fn set_tempo(&mut self, id: ModuleId, bpm: f64, sample_rate: u32, at: u64) {
         if !bpm.is_finite() {
             return;
         }
         if let Some(clock) = self.clocks.iter_mut().find(|c| c.id == id) {
-            clock.samples_per_pulse = samples_per_pulse(sample_rate, bpm);
+            let new = samples_per_pulse(sample_rate, bpm);
+            if clock.playing {
+                let left = (clock.next_pulse_at - at as f64).max(0.0);
+                clock.next_pulse_at = at as f64 + left * new / clock.samples_per_pulse;
+            }
+            clock.samples_per_pulse = new;
+        }
+    }
+
+    /// Notes where every clock is at sample `at`, the start of a block.
+    pub(crate) fn time_clocks(&mut self, at: u64) {
+        for (clock, timing) in self.clocks.iter().zip(&mut self.timings) {
+            *timing = ClockTiming {
+                playing: clock.playing,
+                phase: clock.pulse as f64
+                    - (clock.next_pulse_at - at as f64) / clock.samples_per_pulse,
+                pulses_per_sample: 1.0 / clock.samples_per_pulse,
+                pulses_per_bar: f64::from(clock.pulses_per_bar),
+            };
         }
     }
 
@@ -169,15 +201,15 @@ impl PreparedPatch {
     /// also has keeps holding its note if it still sends it to the same
     /// devices on the same channel. Devices that stop getting a clock that
     /// is playing get a stop, and notes that would be left hanging are
-    /// released.
+    /// released. Loopers and gains carry over as the graph says.
     pub(crate) fn continue_from(
         &mut self,
-        old: &PreparedPatch,
+        old: &mut PreparedPatch,
         at: u64,
         ramp_frames: u32,
         out: &mut Outbox,
     ) {
-        self.graph.continue_from(&old.graph, ramp_frames);
+        self.graph.continue_from(&mut old.graph, ramp_frames);
         for old_clock in old.clocks.iter().filter(|c| c.playing) {
             let kept = self.clocks.iter_mut().find(|c| c.id == old_clock.id);
             let still_sent = match kept {
@@ -261,9 +293,16 @@ pub(crate) fn samples_per_pulse(sample_rate: u32, bpm: f64) -> f64 {
     f64::from(sample_rate) * 60.0 / (bpm * f64::from(PULSES_PER_QUARTER))
 }
 
-/// Checks `patch` and turns it into one the audio thread can run.
-pub(crate) fn prepare(patch: &EnginePatch, sample_rate: u32) -> Result<PreparedPatch, EngineError> {
-    let graph = graph::prepare(&patch.graph)?;
+/// Checks `patch` and turns it into one the audio thread can run. `running`
+/// are the loopers of the patch it is to replace, whose memory it takes
+/// over.
+pub(crate) fn prepare(
+    patch: &EnginePatch,
+    sample_rate: u32,
+    running: &[(NodeId, LooperShape)],
+) -> Result<PreparedPatch, EngineError> {
+    let clock_ids: Vec<ModuleId> = patch.clocks.iter().map(|c| c.id).collect();
+    let graph = graph::prepare(&patch.graph, &clock_ids, sample_rate, running)?;
 
     let mut ids: Vec<ModuleId> = patch
         .clocks
@@ -278,13 +317,14 @@ pub(crate) fn prepare(patch: &EnginePatch, sample_rate: u32) -> Result<PreparedP
 
     let mut clocks = Vec::with_capacity(patch.clocks.len());
     for clock in &patch.clocks {
-        if !clock.bpm.is_finite() {
+        if !clock.bpm.is_finite() || clock.beats_per_bar == 0 {
             return Err(EngineError::InvalidTempo(clock.id));
         }
         clocks.push(Clock {
             id: clock.id,
             playing: false,
             samples_per_pulse: samples_per_pulse(sample_rate, clock.bpm),
+            pulses_per_bar: clock.beats_per_bar.saturating_mul(PULSES_PER_QUARTER),
             next_pulse_at: 0.0,
             pulse: 0,
             midi_to: clock.midi_to.clone(),
@@ -321,6 +361,7 @@ pub(crate) fn prepare(patch: &EnginePatch, sample_rate: u32) -> Result<PreparedP
 
     Ok(PreparedPatch {
         graph,
+        timings: vec![ClockTiming::default(); clocks.len()],
         clocks,
         players,
     })

@@ -77,7 +77,8 @@ one, audio never goes round in a circle. A patch that cannot work is
 refused when it is made, with the reason, instead of doing nothing later.
 
 `trama play` builds its patch in code, with the connections a grid, the
-gamepads and a synth need.
+gamepads and a synth need. It shares one grid between the sequencer and
+the loopers, the line between them set by `--looper-rows`.
 
 ## A module has a core half and an engine half
 
@@ -99,6 +100,10 @@ the old patch and the new one is the same one, by name: it keeps its place
 in the bar and the note it holds, and notes that would be left hanging are
 released where they were sent.
 
+A looper's recordings are the exception: they are audio, minutes of it,
+and only the engine holds them. A looper in both patches, by node id, keeps
+its memory and its loops.
+
 ## One main clock, and nothing assumes it is the only one
 
 Every project has a main clock, as a mixer has a main output, and modules
@@ -106,6 +111,70 @@ that follow a tempo follow it. The engine runs any number of clocks, each
 step player names the one it follows, and a sequencer's `clock` input
 takes another clock when one is connected. MIDI clock to a synth is a
 connection, like notes.
+
+## Bars have four beats
+
+A clock counts bars of four beats from the pulse it starts on, and loopers
+act on them. It is the bar most music people loop is in. The number of
+beats is part of the clock's description in the engine patch, so it can
+differ from one clock to another.
+
+## Loops follow the tempo like tape
+
+A loop on a clock lasts whole bars, and when the tempo changes it plays
+faster or slower to keep filling them, which moves its pitch too, the way
+tape does. Keeping the pitch while changing the speed (time-stretching)
+sounds better but costs far more and makes sounds of its own. The place in
+a loop comes from the clock's place in the bar, sample by sample, so a loop
+never drifts from the clock however long it plays; at the speed it was
+recorded at, it plays its samples as they are.
+
+## A looper is on a clock, or free
+
+Each looper keeps time one way: its loops follow a clock, start and stop on
+its bars and last whole bars, or they are free, start and stop at once and
+last as long as they were recorded. Both kinds on one grid are two
+loopers, each with a zone of the grid, and the scene buttons can go to
+both, since a control may feed any number of inputs. Every module keeps
+its own settings this way.
+
+## Each track of a looper has its own audio
+
+Every track has an input and an output jack per channel, mono or stereo,
+so one track can loop a synth and another a microphone, and each loop can
+go through a gain of its own on the way out. Cables that meet at a track's
+input are recorded together, as on a mixer.
+
+## A press on a playing clip is a setting
+
+By default a press on the clip a track plays stops it on the next bar, so a
+grid needs no row of stop buttons. A looper can instead play the clip again
+from its start, as some clip launchers do, and then stops tracks with its
+`stop` input. A press on what a track waits to do cancels it.
+
+## Loops live in memory taken up front
+
+Recording on the audio thread must not allocate, nor wait for the system
+to provide a page the first time it is written. A looper takes the memory
+for all its recording time when it joins the patch, in chunks, and writes
+to every page then. Clips take chunks as they record and give them back
+when they are emptied, so one long loop or many short ones fit in the
+same memory. A chunk given back goes to the end of the queue of free
+chunks, so a clip emptied while it plays keeps its sound for the few
+milliseconds it takes to fade out.
+When the memory is full, a recording keeps what fits, in whole bars on a
+clock.
+
+## Recordings start one round trip late
+
+What reaches the input was played along with what the speakers played a
+moment before: the output's latency, the input's, and the cushion between
+them. A loop recorded from the bar as it arrives would sound late by all of
+that. The sound card adapter adds up what the system reports for each part
+and what waits in the cushion, and a looper starts and ends every recording
+that much later than the bar. `trama play` takes milliseconds off or adds
+them with `--latency-trim`, for latency the system does not report, such as
+an interface's converters.
 
 ## Names are fixed-size
 

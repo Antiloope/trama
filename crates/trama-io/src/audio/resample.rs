@@ -33,6 +33,8 @@ pub(crate) struct InputResampler {
     resampler: Async<f32>,
     writer: CushionWriter,
     resampled: Vec<f32>,
+    /// How long the filter delays the input, in seconds.
+    delay: f64,
 }
 
 impl InputResampler {
@@ -58,15 +60,19 @@ impl InputResampler {
             )
         })?;
         let resampled = vec![0.0; resampler.output_frames_max() * writer.channels()];
+        let delay = resampler.output_delay() as f64 / f64::from(output_rate);
         Ok(InputResampler {
             resampler,
             writer,
             resampled,
+            delay,
         })
     }
 
-    /// Resamples one input block, interleaved, captured by `at`.
-    pub(crate) fn write(&mut self, samples: &[f32], at: Instant) {
+    /// Resamples one input block, interleaved, captured by `at`, which took
+    /// `input_delay` seconds to get from the device to the callback.
+    pub(crate) fn write(&mut self, samples: &[f32], at: Instant, input_delay: f64) {
+        self.writer.set_input_delay(input_delay + self.delay);
         let channels = self.writer.channels();
         // The ratio glides to the new correction over the next piece.
         let _ = self

@@ -4,15 +4,16 @@ Trama connects synths, MIDI controllers and gamepads and plays them together,
 in time with the sound card, without a DAW. It is free software written in
 Rust, and runs on Linux and macOS.
 
-It runs an 8-step sequencer: a grid controller edits the pattern and shows
-the playhead, gamepads add pitch bend and modulation, and a synth with a
-MIDI input plays the notes and follows Trama's MIDI clock. What reaches the
-sound card's inputs, a synth's audio or a microphone, can play through
-Trama to its outputs.
+It runs an 8-step sequencer and a looper that share a grid controller. The
+grid edits the pattern and shows the playhead, gamepads add pitch bend and
+modulation, and a synth with a MIDI input plays the notes and follows
+Trama's MIDI clock. What reaches the sound card's inputs, a synth's audio
+or a microphone, can play through Trama to its outputs, and the looper
+records it into loops that follow the tempo, or ignore it.
 
-Inside, the sequencer is a module, connected to the devices the way a
-patchbay connects gear; [the architecture](docs/architecture.md) explains
-modules and connections.
+Inside, the sequencer and the looper are modules, connected to the devices
+the way a patchbay connects gear; [the architecture](docs/architecture.md)
+explains modules and connections.
 
 ## Supported devices
 
@@ -90,6 +91,40 @@ more when the input is resampled. At 48 kHz a block of 1024 frames lasts
 more CPU. Trama reports underruns and overruns (input that came too late
 or too early) as they happen.
 
+### Looping
+
+The top four rows of the grid are the looper's clips: a column per track,
+a row per scene. The bottom four are the sequencer's, which then has four
+scale degrees. `--looper-rows` moves the line: `--looper-rows 2` leaves six
+rows to the sequencer, `--looper-rows 0` gives it the whole grid.
+
+`--loop IN:OUT` says what the looper's tracks record and where they play,
+like `--connect`: once for mono tracks, twice for stereo. A synth on inputs
+1 and 2, looped on both speakers:
+
+```sh
+cargo run --release -- play --audio-in "My Interface" --loop 1:1 --loop 2:2
+```
+
+Every track records those inputs. Loops follow the main clock: a press on
+an empty clip records from the next bar, another press ends the recording
+at the end of a bar and plays it, and a press on a clip that plays stops
+it on the next bar. A loop lasts whole bars and follows the tempo like
+tape: faster is also higher. Loops are free instead in the right
+`--free-columns` columns: they start and stop at once, last as long as
+they were recorded, and ignore the tempo, so loops of different lengths
+drift against each other.
+
+The loops live in memory, five minutes of recording for the clips on the
+clock and five more for the free ones, about 115 MB each in stereo. When
+it is full, a recording keeps what fits, in whole bars on the clock.
+
+What reaches the input arrives a little late: the time to be heard, then
+to come back through the input. Trama measures that round trip and records
+every loop that much later, so it lines up with what was heard, and says
+how long it is when it starts. If loops still sound early or late,
+`--latency-trim` adds or takes away milliseconds.
+
 Useful options (`cargo run -- play --help` lists them all):
 
 | Option             | Default    | Meaning                                                   |
@@ -105,13 +140,24 @@ Useful options (`cargo run -- play --help` lists them all):
 | `--audio-in <name>` | none      | sound card input; `default` for the system's          |
 | `--connect <in:out>` | nothing  | patch an input channel to an output channel; repeat it |
 | `--monitor <dB>`   | muted      | monitoring volume: 0 as loud as it comes in, +12 at most |
+| `--looper-rows <n>` | 4         | rows of the grid, from the top, that are looper clips: 0 to 7 |
+| `--free-columns <n>` | 0        | looper columns, from the right, whose loops are free  |
+| `--loop <in:out>`  | nothing    | what every looper track records and where it plays; twice for stereo |
+| `--latency-trim <ms>` | 0       | milliseconds added to the measured round trip         |
 | `--block-size <n>` | the system's | frames per audio block; smaller is less delay       |
 
 Controls:
 
-- **Grid**: each column is a step, each row a scale degree (root at the
-  bottom). The button beside the top row: play/stop; beside the bottom row:
-  clear. Up/down: octave. Left/right: tempo.
+- **Grid, looper rows**: a press on an empty clip records, on the clip
+  recording plays it, on the clip playing stops it; another clip of a
+  track takes its place on the next bar. A clip waiting for the bar flashes
+  the color it is about to have: red to record, green to play, yellow to
+  stop. The buttons beside these rows play a whole scene, and stop the
+  tracks that have nothing in it.
+- **Grid, sequencer rows**: each column is a step, each row a scale degree
+  (root at the bottom). The buttons beside them, from the bottom:
+  play/stop; delete (hold it and press a clip); clear the pattern.
+  Up/down: octave. Left/right: tempo.
 - **Gamepads**: A plays/stops, the left stick bends pitch, the right trigger
   is the modulation wheel, the D-pad does octave and tempo. Every gamepad
   plugged in does the same.

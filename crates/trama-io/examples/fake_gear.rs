@@ -38,10 +38,12 @@ mod fake {
     use trama_io::midi::launchpad_x::{LIVE_MODE, PROGRAMMER_MODE};
     use trama_protocol::MidiMessage;
 
-    /// Pads pressed before playing, as (row, column). In C2 minor, rows 0, 4
-    /// and 2 are C2, G2 and E flat 2.
-    const PADS: [(u8, u8); 4] = [(0, 0), (4, 2), (0, 4), (2, 6)];
-    const EXPECTED_PITCHES: [u8; 4] = [36, 43, 36, 39];
+    /// Pads of the sequencer pressed before playing, as (row, column). In
+    /// C2 minor, rows 0, 3 and 2 are C2, F2 and E flat 2.
+    const PADS: [(u8, u8); 4] = [(0, 0), (3, 2), (0, 4), (2, 6)];
+    const EXPECTED_PITCHES: [u8; 4] = [36, 41, 36, 39];
+    /// The button beside the bottom row: play and stop.
+    const PLAY: u8 = 19;
     const PLAY_FOR: Duration = Duration::from_secs(4);
     const BPM: f64 = 120.0;
 
@@ -82,12 +84,11 @@ mod fake {
             press([0x90, note, 0])?;
         }
         let lit = drain(&lights).len();
-        // Top-right side button: play.
-        press([0xB0, 89, 127])?;
-        press([0xB0, 89, 0])?;
+        press([0xB0, PLAY, 127])?;
+        press([0xB0, PLAY, 0])?;
         thread::sleep(PLAY_FOR);
-        press([0xB0, 89, 127])?;
-        press([0xB0, 89, 0])?;
+        press([0xB0, PLAY, 127])?;
+        press([0xB0, PLAY, 0])?;
         thread::sleep(Duration::from_millis(300));
 
         let received: Vec<(Instant, MidiMessage)> = drain(&synth)

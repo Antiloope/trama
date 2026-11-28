@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! A clock: a tempo, and a transport that starts and stops.
+//! A clock: a tempo, bars of [`BEATS_PER_BAR`] beats, and a transport
+//! that starts and stops.
 //!
 //! Inputs: `play` starts and stops it, `tempo_up` and `tempo_down` change
 //! the tempo by [`TEMPO_NUDGE`], `tempo` sets it in BPM. Outputs: `clock`,
@@ -16,6 +17,9 @@ use crate::module::{Effects, EngineHalf, Module, Port, PortKind};
 
 /// How many BPM `tempo_up` and `tempo_down` add or remove.
 pub const TEMPO_NUDGE: f64 = 5.0;
+
+/// Quarter notes in a bar.
+pub const BEATS_PER_BAR: u32 = 4;
 
 const PORTS: [Port; 8] = [
     Port::input("play", PortKind::Control, true),
@@ -106,7 +110,10 @@ impl Module for Clock {
     }
 
     fn engine_half(&self) -> EngineHalf {
-        EngineHalf::Clock { bpm: self.bpm }
+        EngineHalf::Clock {
+            bpm: self.bpm,
+            beats_per_bar: BEATS_PER_BAR,
+        }
     }
 
     fn shutdown(&mut self, out: &mut Effects) {

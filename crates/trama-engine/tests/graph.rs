@@ -335,6 +335,7 @@ fn step_players_keep_time_while_the_graph_plays() {
             clocks: vec![ClockDescription {
                 id: clock,
                 bpm: 120.0,
+                beats_per_bar: 4,
                 midi_to: vec![synth],
             }],
             step_players: vec![StepPlayerDescription {
